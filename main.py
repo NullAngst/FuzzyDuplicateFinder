@@ -5,20 +5,34 @@ import threading
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QListWidget, QListWidgetItem, QSplitter, QMessageBox, 
-                             QProgressBar, QFrame)
+                             QProgressBar, QFrame, QSizePolicy)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QAction
 from send2trash import send2trash
 
-# Import your engines
-# Make sure scanner_engine.py and matcher.py are in the same folder
+# Visualization libs
+import matplotlib
+matplotlib.use('Agg') # Use non-interactive backend
+import matplotlib.pyplot as plt
+from io import BytesIO
+try:
+    import librosa
+    import librosa.display
+    import numpy as np
+except ImportError:
+    pass
+
+# Import engines
 from scanner_engine import Scanner
 from matcher import Matcher
 
 class WorkerThread(QThread):
-    """Runs the heavy scanning/matching in the background so the UI doesn't freeze."""
+    """
+    Runs the heavy scanning logic in a background thread.
+    Returns the path of the created database upon completion.
+    """
     progress_update = pyqtSignal(str)
-    finished = pyqtSignal()
+    finished = pyqtSignal(str) # Returns path to DB
 
     def __init__(self, target_dir):
         super().__init__()
@@ -27,69 +41,76 @@ class WorkerThread(QThread):
     def run(self):
         self.progress_update.emit("Scanning directory...")
         scanner = Scanner()
-        scanner.scan_directory(self.target_dir)
+        # db_output_path=None forces it to save inside the scanned folder
+        db_path = scanner.scan_directory(self.target_dir, db_output_path=None)
+        
         self.progress_update.emit("Scan complete. Analyzing matches...")
-        self.finished.emit()
+        self.finished.emit(db_path)
 
 class DuplicateFinderApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Insane Duplicate Finder")
-        self.resize(1200, 800)
+        self.resize(1300, 900)
 
         # State
         self.matches = []
         self.current_match_index = -1
+        self.current_db_path = None # Track where our DB is
 
         # --- UI LAYOUT ---
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QVBoxLayout(central_widget)
 
-        # Toolbar / Header
+        # Toolbar
         header_layout = QHBoxLayout()
         self.btn_scan = QPushButton("Select Folder & Scan")
         self.btn_scan.clicked.connect(self.start_scan)
+        
+        self.btn_cleanup = QPushButton("Delete DB & Exit")
+        self.btn_cleanup.setStyleSheet("background-color: #554444;")
+        self.btn_cleanup.clicked.connect(self.cleanup_db)
+        self.btn_cleanup.setEnabled(False)
+
         self.lbl_status = QLabel("Ready")
+        
         header_layout.addWidget(self.btn_scan)
+        header_layout.addWidget(self.btn_cleanup)
         header_layout.addWidget(self.lbl_status)
         main_layout.addLayout(header_layout)
 
         # Progress Bar
         self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 0) # Indeterminate mode
+        self.progress_bar.setRange(0, 0)
         self.progress_bar.hide()
         main_layout.addWidget(self.progress_bar)
 
-        # Splitter (List on left, Details on right)
+        # Splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
         
-        # Left: List of Matches
+        # Left: List
         self.match_list = QListWidget()
         self.match_list.currentRowChanged.connect(self.load_match_details)
         splitter.addWidget(self.match_list)
 
-        # Right: Comparison Area
+        # Right: Comparison Container
         self.comparison_container = QWidget()
         comp_layout = QHBoxLayout(self.comparison_container)
         
-        # File A View
         self.panel_a = self.create_file_panel("File A")
-        # Middle Actions
         self.panel_actions = self.create_action_panel()
-        # File B View
         self.panel_b = self.create_file_panel("File B")
 
-        comp_layout.addLayout(self.panel_a)
-        comp_layout.addLayout(self.panel_actions)
-        comp_layout.addLayout(self.panel_b)
+        # FIX: Access the 'layout' key from the dictionary
+        comp_layout.addLayout(self.panel_a['layout']) 
+        comp_layout.addLayout(self.panel_actions)     
+        comp_layout.addLayout(self.panel_b['layout']) 
         
         splitter.addWidget(self.comparison_container)
-        splitter.setStretchFactor(1, 4) # Give right side more space
+        splitter.setStretchFactor(1, 4)
 
         main_layout.addWidget(splitter)
-
-        # Styling
         self.apply_styles()
 
     def create_file_panel(self, title):
@@ -155,21 +176,27 @@ class DuplicateFinderApp(QMainWindow):
             self.match_list.clear()
             self.progress_bar.show()
             self.btn_scan.setEnabled(False)
+            self.btn_cleanup.setEnabled(False)
             
             self.worker = WorkerThread(folder)
             self.worker.progress_update.connect(lambda s: self.lbl_status.setText(s))
             self.worker.finished.connect(self.on_scan_finished)
             self.worker.start()
 
-    def on_scan_finished(self):
+    def on_scan_finished(self, db_path):
         self.progress_bar.hide()
         self.btn_scan.setEnabled(True)
+        self.btn_cleanup.setEnabled(True)
         self.lbl_status.setText("Scan Complete. Loading matches...")
-        self.load_matches()
+        self.current_db_path = db_path # Save for cleanup later
+        self.load_matches(db_path)
 
-    def load_matches(self):
-        # Use your Matcher engine
-        matcher = Matcher()
+    def load_matches(self, db_path):
+        if not os.path.exists(db_path):
+            self.lbl_status.setText("Error: Database not found.")
+            return
+
+        matcher = Matcher(db_path)
         
         # 1. Exact Matches
         exact = matcher.find_exact_duplicates()
@@ -178,9 +205,8 @@ class DuplicateFinderApp(QMainWindow):
         
         self.matches = []
         
-        # Format Exact matches into pairs for the UI
+        # Format Exact
         for group in exact:
-            # If we have 3 copies (A, B, C), compare A-B, then A-C
             base = group[0]
             for duplicate in group[1:]:
                 self.matches.append({
@@ -190,13 +216,10 @@ class DuplicateFinderApp(QMainWindow):
                     'type': 'Exact MD5'
                 })
 
-        # Add Fuzzy matches
+        # Add Fuzzy
         self.matches.extend(fuzzy)
-
-        # Sort by score
         self.matches.sort(key=lambda x: x['score'], reverse=True)
 
-        # Populate List
         for m in self.matches:
             name_a = os.path.basename(m['file_a'])
             name_b = os.path.basename(m['file_b'])
@@ -207,16 +230,36 @@ class DuplicateFinderApp(QMainWindow):
 
     def load_match_details(self, row_index):
         if row_index < 0 or row_index >= len(self.matches): return
-        
         data = self.matches[row_index]
         self.current_match_index = row_index
         
-        # Update Score
         self.lbl_score.setText(f"{int(data['score'])}%")
-        
-        # Load Files
         self.load_file_into_panel(self.panel_a, data['file_a'])
         self.load_file_into_panel(self.panel_b, data['file_b'])
+
+    def generate_waveform(self, filepath):
+        """Generates a waveform image for audio files."""
+        try:
+            # Load 30 seconds max for speed
+            y, sr = librosa.load(filepath, duration=30)
+            plt.figure(figsize=(4, 3), facecolor="#222222")
+            ax = plt.gca()
+            ax.set_facecolor("#222222")
+            librosa.display.waveshow(y, sr=sr, color="#007acc")
+            plt.axis('off')
+            plt.tight_layout()
+            
+            # Save to buffer
+            buf = BytesIO()
+            plt.savefig(buf, format='png', bbox_inches='tight', pad_inches=0)
+            buf.seek(0)
+            plt.close()
+            
+            qimg = QImage.fromData(buf.read())
+            return QPixmap.fromImage(qimg)
+        except Exception as e:
+            print(f"Waveform Error: {e}")
+            return None
 
     def load_file_into_panel(self, panel, filepath):
         panel['path'] = filepath
@@ -227,27 +270,23 @@ class DuplicateFinderApp(QMainWindow):
             panel['img'].setText("Missing")
             return
 
-        # Info Text
         size_mb = os.path.getsize(filepath) / (1024 * 1024)
         ext = os.path.splitext(filepath)[1].lower()
         info = f"{os.path.basename(filepath)}\n{size_mb:.2f} MB\n{ext}"
         panel['info'].setText(info)
         
-        # Button Connection
-        try: 
-            panel['btn_open'].clicked.disconnect() 
+        # Connect Open Button
+        try: panel['btn_open'].clicked.disconnect() 
         except: pass
         panel['btn_open'].clicked.connect(lambda: os.startfile(filepath) if os.name == 'nt' else os.system(f"open '{filepath}'"))
 
-        # Image Preview
+        # --- PREVIEW LOGIC ---
         if ext in ['.jpg', '.png', '.jpeg', '.bmp']:
             pixmap = QPixmap(filepath)
             if not pixmap.isNull():
                 panel['img'].setPixmap(pixmap.scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio))
-            else:
-                panel['img'].setText("Image Error")
+        
         elif ext in ['.mp4', '.avi', '.mkv']:
-            # Attempt to grab a thumbnail using CV2
             try:
                 cap = cv2.VideoCapture(filepath)
                 ret, frame = cap.read()
@@ -257,28 +296,36 @@ class DuplicateFinderApp(QMainWindow):
                     h, w, ch = frame.shape
                     qimg = QImage(frame.data, w, h, ch * w, QImage.Format.Format_RGB888)
                     panel['img'].setPixmap(QPixmap.fromImage(qimg).scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio))
-                else:
-                    panel['img'].setText("Video (No Preview)")
             except:
                 panel['img'].setText("Video File")
+        
+        elif ext in ['.mp3', '.wav', '.flac']:
+            # Generate Audio Waveform
+            panel['img'].setText("Generating Waveform...")
+            # We process this in main thread for simplicity, 
+            # though ideally this should be threaded for large files.
+            waveform = self.generate_waveform(filepath)
+            if waveform:
+                panel['img'].setPixmap(waveform)
+            else:
+                panel['img'].setText("Audio File (No Preview)")
+        
         else:
             panel['img'].setText(f"{ext} File")
 
     def delete_file(self, target):
         if self.current_match_index == -1: return
-        
         panel = self.panel_a if target == "A" else self.panel_b
         filepath = panel['path']
 
         confirm = QMessageBox.question(self, "Confirm Delete", 
-                                       f"Are you sure you want to send this to Trash?\n{filepath}",
+                                       f"Send to Trash?\n{filepath}",
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         
         if confirm == QMessageBox.StandardButton.Yes:
             try:
                 send2trash(filepath)
                 self.lbl_status.setText(f"Deleted {os.path.basename(filepath)}")
-                # Move to next item automatically
                 self.next_match()
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
@@ -288,8 +335,25 @@ class DuplicateFinderApp(QMainWindow):
         if current_row < self.match_list.count() - 1:
             self.match_list.setCurrentRow(current_row + 1)
 
+    def cleanup_db(self):
+        """Deletes the database file to leave the folder clean."""
+        if self.current_db_path and os.path.exists(self.current_db_path):
+            confirm = QMessageBox.question(self, "Clean Up", 
+                                           "This will delete the 'duplicate_index.db' file from the folder.\nScan results will be lost.\n\nContinue?",
+                                           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            if confirm == QMessageBox.StandardButton.Yes:
+                try:
+                    # Close connections in matcher? 
+                    # Actually, matcher recreates connection every time, but just to be safe:
+                    # We can't easily force close the matcher's pointer here without restructuring,
+                    # but usually it's fine if the scan is done.
+                    os.remove(self.current_db_path)
+                    QMessageBox.information(self, "Done", "Database deleted.")
+                    self.close()
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Could not delete DB: {e}")
+
     def apply_styles(self):
-        # Dark Theme because we are civilized
         self.setStyleSheet("""
             QMainWindow { background-color: #333; color: #fff; }
             QLabel { color: #eee; }
