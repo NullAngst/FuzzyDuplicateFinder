@@ -2,8 +2,6 @@ PyQt6
 opencv-python
 imagehash
 Pillow
-librosa
-numpy
 send2trash
+numpy
 librosa
-matplotlib
