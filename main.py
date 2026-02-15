@@ -38,7 +38,7 @@ class ScanAndMatchWorker(QThread):
         super().__init__()
         self.folder_list = folder_list 
         self.db_path = db_path
-        self.skip_scan = skip_scan # New flag to bypass scan and go straight to match
+        self.skip_scan = skip_scan
         self._is_running = True
 
     def stop(self):
@@ -52,9 +52,14 @@ class ScanAndMatchWorker(QThread):
             self.progress_value.emit(current, total)
             self.progress_update.emit(f"Scanning: {current} / {total} files (Skipped: {skipped})")
 
+    # NEW: Callback for Phase 2
+    def on_match_progress(self, current, total):
+        if self._is_running:
+            self.progress_value.emit(current, total)
+
     def run(self):
         try:
-            # 1. SCAN PHASE (Optional)
+            # 1. SCAN PHASE
             if not self.skip_scan:
                 self.progress_update.emit("Phase 1: Indexing files...")
                 scanner = Scanner()
@@ -64,27 +69,27 @@ class ScanAndMatchWorker(QThread):
                     stop_signal=self.is_stopped,
                     progress_callback=self.on_scan_progress
                 )
-                if self.is_stopped():
-                    self.aborted.emit()
-                    return
-                if not db_path or not os.path.exists(db_path):
-                    self.error.emit("Database creation failed.")
-                    return
+                if self.is_stopped(): self.aborted.emit(); return
+                if not db_path: self.error.emit("DB Failed"); return
             else:
-                self.progress_update.emit("Skipping scan. Loading existing index...")
+                self.progress_update.emit("Skipping scan. Loading index...")
 
             # 2. MATCH PHASE
-            self.progress_update.emit("Phase 2: Analyzing duplicates...")
+            self.progress_update.emit("Phase 2: Analyzing content...")
             matcher = Matcher(self.db_path)
             
             exact = matcher.find_exact_duplicates()
-            if self.is_stopped(): 
-                matcher.close(); self.aborted.emit(); return
+            if self.is_stopped(): matcher.close(); self.aborted.emit(); return
 
-            fuzzy = matcher.find_fuzzy_matches(stop_signal=self.is_stopped)
-            if self.is_stopped():
-                matcher.close(); self.aborted.emit(); return
+            # Pass the new progress callback here
+            fuzzy = matcher.find_fuzzy_matches(
+                stop_signal=self.is_stopped,
+                progress_callback=self.on_match_progress 
+            )
             
+            if self.is_stopped(): matcher.close(); self.aborted.emit(); return
+            
+            # Merging results...
             final_matches = []
             for group in exact:
                 base = group[0]
@@ -102,8 +107,7 @@ class ScanAndMatchWorker(QThread):
             self.finished.emit(final_matches)
 
         except Exception as e:
-            if not self.is_stopped():
-                self.error.emit(str(e))
+            if not self.is_stopped(): self.error.emit(str(e))
 
 class DuplicateFinderApp(QMainWindow):
     def __init__(self):
@@ -284,9 +288,12 @@ class DuplicateFinderApp(QMainWindow):
         lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_img.setStyleSheet("background-color: #111; border: 1px solid #333; border-radius: 4px;")
         
-        # FIX FOR JITTER: Set Size Policy to Ignored
-        lbl_img.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
-        lbl_img.setMinimumSize(100, 100)
+        # --- FIX FOR TINY IMAGES ---
+        # "Expanding" means: "I want to grow as much as possible, 
+        # but I am willing to shrink if the window gets small."
+        lbl_img.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        lbl_img.setMinimumSize(50, 50) 
+        
         layout.addWidget(lbl_img)
         
         meta_frame = QFrame()
