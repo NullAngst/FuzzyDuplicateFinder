@@ -8,8 +8,9 @@ from datetime import datetime
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QListWidget, QListWidgetItem, QSplitter, QMessageBox, 
-                             QProgressBar, QFrame, QSizePolicy, QMenu)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QWaitCondition, QMutex
+                             QProgressBar, QFrame, QSizePolicy, QMenu, QTableWidget, 
+                             QTableWidgetItem, QHeaderView, QAbstractItemView, QSpinBox)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QAction
 from send2trash import send2trash
 from PIL import Image
@@ -28,30 +29,41 @@ def format_size(size_bytes):
 
 class ScanAndMatchWorker(QThread):
     progress_update = pyqtSignal(str)
+    progress_value = pyqtSignal(int, int) # current, total
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
-    aborted = pyqtSignal() # New signal for stopping
+    aborted = pyqtSignal()
 
     def __init__(self, folder_list, db_path):
         super().__init__()
-        self.folder_list = folder_list
+        self.folder_list = folder_list # List of dicts: {'path': str, 'priority': int}
         self.db_path = db_path
         self._is_running = True
 
     def stop(self):
-        """Flag the thread to stop."""
         self._is_running = False
 
     def is_stopped(self):
-        """Callback function for the engines."""
         return not self._is_running
+
+    # Callback for the scanner engine
+    def on_scan_progress(self, current, total, skipped):
+        if self._is_running:
+            self.progress_value.emit(current, total)
+            self.progress_update.emit(f"Scanning: {current} / {total} files (Skipped: {skipped})")
 
     def run(self):
         try:
-            self.progress_update.emit("Phase 1/2: Scanning files...")
+            self.progress_update.emit("Phase 1: Indexing files...")
             scanner = Scanner()
-            # Pass the check_stop callback
-            db_path = scanner.scan_directory(self.folder_list, self.db_path, stop_signal=self.is_stopped)
+            
+            # Pass the folder list (scanner now handles dicts or strings)
+            db_path = scanner.scan_directory(
+                self.folder_list, 
+                self.db_path, 
+                stop_signal=self.is_stopped,
+                progress_callback=self.on_scan_progress
+            )
 
             if self.is_stopped():
                 self.aborted.emit()
@@ -61,10 +73,9 @@ class ScanAndMatchWorker(QThread):
                 self.error.emit("Database creation failed.")
                 return
 
-            self.progress_update.emit("Phase 2/2: Analyzing duplicates...")
+            self.progress_update.emit("Phase 2: Analyzing duplicates...")
             matcher = Matcher(db_path)
             
-            # Run matching with stop check
             exact = matcher.find_exact_duplicates()
             if self.is_stopped(): 
                 matcher.close()
@@ -103,11 +114,12 @@ class DuplicateFinderApp(QMainWindow):
         self.setWindowTitle("Fuzzy Duplicate Finder")
         self.resize(1400, 900) 
 
-        self.scan_folders = []
+        # State: scan_folders is now a list of dicts: {'path': 'C:/...', 'priority': 1}
+        self.scan_folders = [] 
         self.matches = []
         self.current_match_index = -1
         self.current_db_path = None
-        self.worker = None # Keep track of worker
+        self.worker = None
         self.pixmap_cache = {'A': None, 'B': None}
 
         # --- MENU BAR ---
@@ -129,51 +141,61 @@ class DuplicateFinderApp(QMainWindow):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(0)
 
-        # 1. TOOLBAR
+        # 1. TOOLBAR AREA
         toolbar_frame = QFrame()
         toolbar_frame.setStyleSheet("background-color: #2b2b2b; border-bottom: 1px solid #3e3e3e;")
-        toolbar_layout = QHBoxLayout(toolbar_frame)
-        
-        self.lbl_folders = QLabel("No folders selected")
-        self.lbl_folders.setStyleSheet("color: #ccc; font-style: italic; margin-right: 10px;")
-        
+        toolbar_layout = QVBoxLayout(toolbar_frame) # Changed to VBox to hold table
+
+        # Button Row
+        btn_row = QHBoxLayout()
         btn_add_folder = QPushButton(" + Add Folder ")
         btn_add_folder.clicked.connect(self.add_folder)
         self.style_button(btn_add_folder, bg="#444")
 
-        btn_clear_folders = QPushButton(" Clear ")
+        btn_clear_folders = QPushButton(" Clear List ")
         btn_clear_folders.clicked.connect(self.clear_folders)
         self.style_button(btn_clear_folders, bg="#444")
 
-        # Start Button
         self.btn_scan = QPushButton("  START SCAN  ")
         self.btn_scan.setEnabled(False)
         self.btn_scan.clicked.connect(self.start_scan)
         self.style_button(self.btn_scan, bg="#007acc")
 
-        # Stop Button
         self.btn_stop = QPushButton("  STOP  ")
         self.btn_stop.setEnabled(False)
         self.btn_stop.clicked.connect(self.stop_scan)
         self.style_button(self.btn_stop, bg="#d32f2f")
         
         self.lbl_status = QLabel("Ready")
-        self.lbl_status.setStyleSheet("color: #aaa; margin-left: 10px;")
+        self.lbl_status.setStyleSheet("color: #aaa; margin-left: 10px; font-weight: bold;")
         
-        toolbar_layout.addWidget(self.lbl_folders)
-        toolbar_layout.addWidget(btn_add_folder)
-        toolbar_layout.addWidget(btn_clear_folders)
-        toolbar_layout.addSpacing(20)
-        toolbar_layout.addWidget(self.btn_scan)
-        toolbar_layout.addWidget(self.btn_stop)
-        toolbar_layout.addWidget(self.lbl_status)
-        toolbar_layout.addStretch()
+        btn_row.addWidget(btn_add_folder)
+        btn_row.addWidget(btn_clear_folders)
+        btn_row.addSpacing(20)
+        btn_row.addWidget(self.btn_scan)
+        btn_row.addWidget(self.btn_stop)
+        btn_row.addWidget(self.lbl_status)
+        btn_row.addStretch()
+
+        # Folder List Table
+        self.folder_table = QTableWidget()
+        self.folder_table.setColumnCount(2)
+        self.folder_table.setHorizontalHeaderLabels(["Folder Path", "Priority"])
+        self.folder_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.folder_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.folder_table.setColumnWidth(1, 80)
+        self.folder_table.setFixedHeight(100) # Keep it compact
+        self.folder_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.folder_table.setStyleSheet("QTableWidget { background-color: #222; color: #eee; border: 1px solid #444; } QHeaderView::section { background-color: #333; color: #ddd; }")
+        
+        toolbar_layout.addLayout(btn_row)
+        toolbar_layout.addWidget(self.folder_table)
         
         main_layout.addWidget(toolbar_frame)
 
         # Progress Bar
         self.progress_bar = QProgressBar()
-        self.progress_bar.setFixedHeight(5)
+        self.progress_bar.setFixedHeight(8)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setStyleSheet("QProgressBar { background: #222; border: none; } QProgressBar::chunk { background: #007acc; }")
         self.progress_bar.hide()
@@ -240,31 +262,11 @@ class DuplicateFinderApp(QMainWindow):
         splitter.setSizes([350, 900])
         main_layout.addWidget(splitter)
 
-    # FIXED: Style button without using 'filter' to avoid console warnings
     def style_button(self, btn, bg):
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        # Manually calculate a hover color or use a simpler mapping
-        hover_map = {
-            "#d32f2f": "#ef5350", # Red Lighter
-            "#007acc": "#2196f3", # Blue Lighter
-            "#444": "#666",       # Gray Lighter
-            "#555": "#777"        # Dark Gray Lighter
-        }
+        hover_map = { "#d32f2f": "#ef5350", "#007acc": "#2196f3", "#444": "#666", "#555": "#777" }
         hover_color = hover_map.get(bg, bg)
-
-        btn.setStyleSheet(f"""
-            QPushButton {{ 
-                background-color: {bg}; 
-                color: white; 
-                padding: 8px 16px; 
-                font-weight: bold; 
-                border-radius: 4px; 
-                border: none; 
-            }}
-            QPushButton:hover {{ background-color: {hover_color}; }}
-            QPushButton:pressed {{ background-color: {bg}; }}
-            QPushButton:disabled {{ background-color: #333; color: #555; }}
-        """)
+        btn.setStyleSheet(f"QPushButton {{ background-color: {bg}; color: white; padding: 8px 16px; font-weight: bold; border-radius: 4px; border: none; }} QPushButton:hover {{ background-color: {hover_color}; }} QPushButton:pressed {{ background-color: {bg}; }} QPushButton:disabled {{ background-color: #333; color: #555; }}")
 
     def create_file_panel(self, title):
         container = QWidget()
@@ -290,87 +292,88 @@ class DuplicateFinderApp(QMainWindow):
         lbl_filename = QLabel("Filename")
         lbl_filename.setStyleSheet("font-size: 14px; font-weight: bold; color: white;")
         lbl_filename.setWordWrap(True)
-        
-        lbl_path = QLabel("Path")
-        lbl_path.setStyleSheet("font-size: 11px; color: #aaa;")
-        lbl_path.setWordWrap(True)
-        
-        lbl_details = QLabel("Details")
-        lbl_details.setStyleSheet("font-size: 11px; color: #ccc; margin-top: 4px;")
-        
-        lbl_dates = QLabel("Dates")
-        lbl_dates.setStyleSheet("font-size: 11px; color: #888;")
+        lbl_path = QLabel("Path"); lbl_path.setStyleSheet("font-size: 11px; color: #aaa;"); lbl_path.setWordWrap(True)
+        lbl_details = QLabel("Details"); lbl_details.setStyleSheet("font-size: 11px; color: #ccc; margin-top: 4px;")
+        lbl_dates = QLabel("Dates"); lbl_dates.setStyleSheet("font-size: 11px; color: #888;")
 
         btn_open = QPushButton("Open in Explorer")
         btn_open.setStyleSheet("background: transparent; color: #007acc; text-align: left; padding: 0; border: none;")
         btn_open.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        meta_layout.addWidget(lbl_filename)
-        meta_layout.addWidget(lbl_path)
-        meta_layout.addWidget(lbl_details)
-        meta_layout.addWidget(lbl_dates)
-        meta_layout.addWidget(btn_open)
+        meta_layout.addWidget(lbl_filename); meta_layout.addWidget(lbl_path); meta_layout.addWidget(lbl_details); meta_layout.addWidget(lbl_dates); meta_layout.addWidget(btn_open)
         layout.addWidget(meta_frame)
-        
-        return {
-            "container": container, "img": lbl_img, "filename": lbl_filename, 
-            "path": lbl_path, "details": lbl_details, "dates": lbl_dates,
-            "btn_open": btn_open, "filepath": None
-        }
+        return {"container": container, "img": lbl_img, "filename": lbl_filename, "path": lbl_path, "details": lbl_details, "dates": lbl_dates, "btn_open": btn_open, "filepath": None}
 
     def add_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Directory")
         if folder:
-            if folder not in self.scan_folders:
-                self.scan_folders.append(folder)
-                self.update_folder_ui()
+            # Check for dupes
+            for f in self.scan_folders:
+                if f['path'] == folder: return
+            
+            # Default Priority 10
+            self.scan_folders.append({'path': folder, 'priority': 10})
+            self.refresh_folder_table()
+            self.btn_scan.setEnabled(True)
 
     def clear_folders(self):
         self.scan_folders = []
-        self.update_folder_ui()
+        self.refresh_folder_table()
+        self.btn_scan.setEnabled(False)
 
-    def update_folder_ui(self):
-        count = len(self.scan_folders)
-        if count == 0:
-            self.lbl_folders.setText("No folders selected")
-            self.btn_scan.setEnabled(False)
-        else:
-            base = os.path.basename(self.scan_folders[0])
-            if count == 1:
-                self.lbl_folders.setText(f"Scanning: {base}")
-            else:
-                self.lbl_folders.setText(f"Scanning: {base} + {count-1} others")
-            self.btn_scan.setEnabled(True)
+    def refresh_folder_table(self):
+        self.folder_table.setRowCount(len(self.scan_folders))
+        for i, folder_data in enumerate(self.scan_folders):
+            # Path Item
+            path_item = QTableWidgetItem(folder_data['path'])
+            path_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+            self.folder_table.setItem(i, 0, path_item)
+            
+            # Priority Spinbox
+            spin = QSpinBox()
+            spin.setRange(0, 100)
+            spin.setValue(folder_data['priority'])
+            spin.setStyleSheet("background-color: #444; color: white; border: none;")
+            # Connect value change to update data
+            spin.valueChanged.connect(lambda val, idx=i: self.update_priority(idx, val))
+            self.folder_table.setCellWidget(i, 1, spin)
+
+    def update_priority(self, index, value):
+        if 0 <= index < len(self.scan_folders):
+            self.scan_folders[index]['priority'] = value
 
     def start_scan(self):
         if not self.scan_folders: return
 
         if len(self.scan_folders) == 1:
-            self.current_db_path = os.path.join(self.scan_folders[0], "duplicate_index.db")
+            self.current_db_path = os.path.join(self.scan_folders[0]['path'], "duplicate_index.db")
         else:
             save_path, _ = QFileDialog.getSaveFileName(self, "Save Database Location", "duplicate_index.db", "Database Files (*.db)")
-            if save_path:
-                self.current_db_path = save_path
-            else:
-                return 
+            if save_path: self.current_db_path = save_path
+            else: return 
 
         self.lbl_status.setText("Initializing scan...")
         self.match_list.clear()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.show()
         self.btn_scan.setEnabled(False)
-        self.btn_stop.setEnabled(True) # Enable Stop Button
+        self.btn_stop.setEnabled(True)
         
         self.worker = ScanAndMatchWorker(self.scan_folders, self.current_db_path)
         self.worker.progress_update.connect(lambda s: self.lbl_status.setText(s))
+        self.worker.progress_value.connect(self.update_progress_bar)
         self.worker.finished.connect(self.on_process_complete)
         self.worker.aborted.connect(self.on_scan_aborted)
         self.worker.error.connect(self.on_error)
         self.worker.start()
 
+    def update_progress_bar(self, current, total):
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(current)
+
     def stop_scan(self):
         if self.worker and self.worker.isRunning():
-            self.lbl_status.setText("Stopping... Please wait for current file.")
+            self.lbl_status.setText("Stopping... Please wait.")
             self.btn_stop.setEnabled(False)
             self.worker.stop()
 
@@ -378,7 +381,7 @@ class DuplicateFinderApp(QMainWindow):
         self.progress_bar.hide()
         self.btn_scan.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.lbl_status.setText("Scan Aborted by User.")
+        self.lbl_status.setText("Scan Aborted.")
         
     def on_process_complete(self, matches):
         self.progress_bar.hide()
@@ -396,8 +399,7 @@ class DuplicateFinderApp(QMainWindow):
         if len(self.matches) > 0:
             self.match_list.setCurrentRow(0)
         else:
-            if len(self.matches) == 0:
-                QMessageBox.information(self, "Clean!", "No duplicates found.")
+            QMessageBox.information(self, "Clean!", "No duplicates found.")
 
     def on_error(self, message):
         self.progress_bar.hide()
@@ -412,7 +414,6 @@ class DuplicateFinderApp(QMainWindow):
         
         score_text = "Exact Match" if data['type'] == 'EXACT' else f"{int(data['score'])}% Match"
         self.lbl_score.setText(score_text)
-        
         self.load_file_to_panel(self.panel_a, data['file_a'], 'A')
         self.load_file_to_panel(self.panel_b, data['file_b'], 'B')
 
@@ -421,19 +422,18 @@ class DuplicateFinderApp(QMainWindow):
         self.pixmap_cache[cache_key] = None
         
         if not os.path.exists(filepath):
-            panel['filename'].setText("File Not Found")
-            panel['img'].setText("Missing")
+            panel['filename'].setText("File Missing")
+            panel['path'].setText(filepath)
+            panel['img'].setText("Missing on Disk")
             return
 
         filename = os.path.basename(filepath)
         stats = os.stat(filepath)
         size_str = format_size(stats.st_size)
         ext = os.path.splitext(filepath)[1].lower()
-        
         c_time = datetime.fromtimestamp(stats.st_ctime).strftime('%Y-%m-%d %H:%M')
         m_time = datetime.fromtimestamp(stats.st_mtime).strftime('%Y-%m-%d %H:%M')
         panel['dates'].setText(f"Created: {c_time}  |  Modified: {m_time}")
-
         panel['filename'].setText(filename)
         panel['path'].setText(os.path.dirname(filepath))
         
@@ -443,7 +443,6 @@ class DuplicateFinderApp(QMainWindow):
 
         res_str = ""
         extra_str = ""
-        
         is_video = ext in ['.mp4', '.avi', '.mkv', '.mov', '.wmv', '.m4v', '.webm', '.ts']
         is_image = ext in ['.jpg', '.png', '.jpeg', '.bmp', '.gif', '.webp', '.tiff']
 
@@ -455,11 +454,8 @@ class DuplicateFinderApp(QMainWindow):
                 if not pixmap.isNull():
                     self.pixmap_cache[cache_key] = pixmap
                     self.update_image_display(panel, pixmap)
-                else:
-                    panel['img'].setText("Image Error")
-            except:
-                panel['img'].setText("Image Error")
-                
+                else: panel['img'].setText("Image Error")
+            except: panel['img'].setText("Image Error")
         elif is_video:
             try:
                 cap = cv2.VideoCapture(filepath)
@@ -467,17 +463,12 @@ class DuplicateFinderApp(QMainWindow):
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                     res_str = f"{w}x{h}"
-                    
                     fps = cap.get(cv2.CAP_PROP_FPS)
                     frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-                    
                     if fps > 0 and frame_count > 0:
                         duration_sec = int(frame_count / fps)
                         mins, secs = divmod(duration_sec, 60)
                         extra_str = f"Duration: {mins}:{secs:02d}"
-                        bitrate_bps = (stats.st_size * 8) / (frame_count / fps)
-                        extra_str += f" ({int(bitrate_bps/1000)} kbps)"
-
                     cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count // 3) 
                     ret, frame = cap.read()
                     if ret:
@@ -487,18 +478,14 @@ class DuplicateFinderApp(QMainWindow):
                         pixmap = QPixmap.fromImage(qimg)
                         self.pixmap_cache[cache_key] = pixmap
                         self.update_image_display(panel, pixmap)
-                    else:
-                        panel['img'].setText("No Preview")
+                    else: panel['img'].setText("No Preview")
                     cap.release()
-                else:
-                    panel['img'].setText("Video File")
-            except:
-                panel['img'].setText("Video Error")
-        
+                else: panel['img'].setText("Video File")
+            except: panel['img'].setText("Video Error")
         else:
             panel['img'].setText(f"📄 {ext} File")
             panel['img'].setStyleSheet("background-color: #222; border: 1px solid #333; color: #555; font-size: 20px;")
-
+        
         details = f"Size: {size_str}"
         if res_str: details += f"  |  Res: {res_str}"
         if extra_str: details += f"  |  {extra_str}"
@@ -524,7 +511,16 @@ class DuplicateFinderApp(QMainWindow):
             try:
                 send2trash(filepath)
                 self.lbl_status.setText(f"Deleted {os.path.basename(filepath)}")
+                
+                # Logic to keep focus/selection
+                old_row = self.current_match_index
+                
+                # We do NOT remove from self.matches automatically because A or B might still exist 
+                # (fuzzy match scenarios). But typically the user wants to move on.
                 self.next_match()
+                
+                # Refocus list
+                self.match_list.setFocus()
             except Exception as e:
                 QMessageBox.critical(self, "Error", str(e))
 
@@ -532,13 +528,26 @@ class DuplicateFinderApp(QMainWindow):
         current_row = self.match_list.currentRow()
         if current_row < self.match_list.count() - 1:
             self.match_list.setCurrentRow(current_row + 1)
+            self.match_list.scrollToItem(self.match_list.currentItem()) # Ensure visibility
         else:
             QMessageBox.information(self, "Done", "No more matches!")
+
+    def get_folder_priority(self, filepath):
+        """Finds priority of the folder containing this file."""
+        best_priority = 0
+        # Normalize slashes
+        filepath = os.path.normpath(filepath)
+        
+        for folder_data in self.scan_folders:
+            root = os.path.normpath(folder_data['path'])
+            if filepath.startswith(root):
+                return folder_data['priority']
+        return 0
 
     def auto_prune_exact(self):
         exact_matches = [m for m in self.matches if m['type'] == 'EXACT']
         if not exact_matches:
-            QMessageBox.information(self, "Auto-Prune", "No exact duplicates found to prune.")
+            QMessageBox.information(self, "Auto-Prune", "No exact duplicates found.")
             return
 
         files_to_trash = set()
@@ -548,19 +557,31 @@ class DuplicateFinderApp(QMainWindow):
             path_a = m['file_a']
             path_b = m['file_b']
             
-            # Keep shortest path (closest to root)
-            if len(path_a) <= len(path_b):
-                loser = path_b
+            prio_a = self.get_folder_priority(path_a)
+            prio_b = self.get_folder_priority(path_b)
+            
+            # Logic: Higher Priority = Keep.
+            # If Priorities equal, Keep Shorter Path.
+            
+            loser = None
+            if prio_a > prio_b:
+                loser = path_b # B is lower priority, delete B
+            elif prio_b > prio_a:
+                loser = path_a # A is lower priority, delete A
             else:
-                loser = path_a
+                # Priorities equal, check path length
+                if len(path_a) <= len(path_b):
+                    loser = path_b
+                else:
+                    loser = path_a
                 
-            if loser not in files_to_trash:
+            if loser and loser not in files_to_trash:
                 files_to_trash.add(loser)
                 count += 1
 
         if count == 0: return
 
-        msg = f"Found {count} exact duplicate files to remove.\nStrategy: Keeping files with shorter paths.\nMove to Trash?"
+        msg = f"Found {count} exact duplicate files to remove.\nStrategy: Lower Priority Folders first, then Longer Paths.\nMove to Trash?"
         confirm = QMessageBox.question(self, "Auto-Prune", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         
         if confirm == QMessageBox.StandardButton.Yes:
@@ -586,24 +607,16 @@ class DuplicateFinderApp(QMainWindow):
                 self.update_image_display(self.panel_b, self.pixmap_cache['B'])
         super().resizeEvent(event)
 
-    # FIXED: Graceful Exit ensures threads stop and DB is released
     def closeEvent(self, event):
-        # 1. Stop the worker if running
         if self.worker and self.worker.isRunning():
             self.worker.stop()
-            self.worker.wait(1000) # Wait up to 1 second for it to release locks
+            self.worker.wait(1000) 
         
-        # 2. Ask to delete DB
         if self.current_db_path and os.path.exists(self.current_db_path):
-            reply = QMessageBox.question(self, "Cleanup", 
-                                         "Delete the index database file before exiting?",
-                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            reply = QMessageBox.question(self, "Cleanup", "Delete the index database file before exiting?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                try:
-                    os.remove(self.current_db_path)
-                except Exception as e:
-                    # If file is still locked, we can't do much, but we tried.
-                    print(f"Error deleting DB: {e}")
+                try: os.remove(self.current_db_path)
+                except: pass
         event.accept()
 
 if __name__ == "__main__":

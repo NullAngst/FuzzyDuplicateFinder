@@ -15,7 +15,6 @@ class Matcher:
         self.conn.row_factory = sqlite3.Row 
 
     def close(self):
-        """Explicitly close connection."""
         try:
             self.conn.close()
         except:
@@ -23,22 +22,31 @@ class Matcher:
 
     def fetch_all_files(self):
         cursor = self.conn.execute("SELECT * FROM files")
-        return [dict(row) for row in cursor.fetchall()]
+        # FIX: Filter out files that no longer exist on disk
+        valid_files = []
+        for row in cursor.fetchall():
+            d = dict(row)
+            if os.path.exists(d['path']):
+                valid_files.append(d)
+        return valid_files
 
     def find_exact_duplicates(self):
-        query = """
-        SELECT exact_hash, COUNT(*) as count 
-        FROM files 
-        WHERE exact_hash IS NOT NULL 
-        GROUP BY exact_hash 
-        HAVING count > 1
-        """
-        cursor = self.conn.execute(query)
+        # We fetch all valid files first to ensure existence
+        all_files = self.fetch_all_files()
+        
+        # Group by Exact Hash manually to ensure we only group existing files
+        hash_map = {}
+        for f in all_files:
+            if f['exact_hash']:
+                if f['exact_hash'] not in hash_map:
+                    hash_map[f['exact_hash']] = []
+                hash_map[f['exact_hash']].append(f)
+        
         exact_groups = []
-        for row in cursor.fetchall():
-            file_hash = row['exact_hash']
-            files_cursor = self.conn.execute("SELECT path, filename FROM files WHERE exact_hash = ?", (file_hash,))
-            exact_groups.append([dict(f) for f in files_cursor.fetchall()])
+        for k, group in hash_map.items():
+            if len(group) > 1:
+                exact_groups.append(group)
+                
         return exact_groups
 
     def calculate_score(self, file_a, file_b):
@@ -88,7 +96,6 @@ class Matcher:
         total = len(files)
         
         for i in range(total):
-            # CHECK STOP SIGNAL inside the loop
             if stop_signal and stop_signal():
                 self.close()
                 return []
@@ -98,8 +105,8 @@ class Matcher:
                 
                 is_aud_1 = f1['extension'] in ['.mp3','.wav','.flac','.m4a','.wma']
                 is_aud_2 = f2['extension'] in ['.mp3','.wav','.flac','.m4a','.wma']
-                is_vis_1 = f1['extension'] in ['.jpg','.png','.mp4','.avi','.m4v','.mov']
-                is_vis_2 = f2['extension'] in ['.jpg','.png','.mp4','.avi','.m4v','.mov']
+                is_vis_1 = f1['extension'] in ['.jpg','.png','.mp4','.avi','.m4v','.mov','.webm','.mkv']
+                is_vis_2 = f2['extension'] in ['.jpg','.png','.mp4','.avi','.m4v','.mov','.webm','.mkv']
 
                 if (is_aud_1 != is_aud_2) and (f1['filename'] != f2['filename']): continue
                 if (is_vis_1 != is_vis_2) and (f1['filename'] != f2['filename']): continue
@@ -114,10 +121,3 @@ class Matcher:
         
         self.close()
         return potential_matches
-
-if __name__ == "__main__":
-    try:
-        m = Matcher("duplicate_index.db")
-        print(f"Fuzzy matches found: {len(m.find_fuzzy_matches())}")
-    except Exception as e:
-        print(e)
