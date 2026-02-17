@@ -181,8 +181,14 @@ class Scanner:
             visual_hash = None
             audio_hash = None
 
-            if is_img or is_vid: visual_hash = self.generate_visual_hash(filepath, ext)
-            if is_aud: audio_hash = self.generate_audio_hash(filepath)
+            if is_img or is_vid: 
+                visual_hash = self.generate_visual_hash(filepath, ext)
+                if visual_hash is None: # The file was "bad" and couldn't be hashed
+                    return False
+            if is_aud: 
+                audio_hash = self.generate_audio_hash(filepath)
+                if audio_hash is None:
+                    return False
 
             data = (filepath, filename, ext, size, mtime, ctime, exact_hash, visual_hash, audio_hash, datetime.now().isoformat())
             self.db.upsert_file(data)
@@ -211,22 +217,31 @@ class Scanner:
         
         processed_count = 0
         skipped_count = 0
+        skipped_files_list = []
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             future_to_file = {executor.submit(self.process_file, fp): fp for fp in files_to_process}
             
             for future in concurrent.futures.as_completed(future_to_file):
+                filepath = future_to_file[future]
                 if stop_signal and stop_signal(): break
+                
                 try:
                     success = future.result()
-                    if not success: skipped_count += 1
-                except: skipped_count += 1
+                    if not success: 
+                        skipped_count += 1
+                        skipped_files_list.append(filepath)
+                except: 
+                    skipped_count += 1
+                    skipped_files_list.append(filepath)
                 
                 processed_count += 1
                 if progress_callback and processed_count % 10 == 0:
                     progress_callback(processed_count, total_files, skipped_count)
 
         self.db.close()
-        if stop_signal and stop_signal(): return None
+        if stop_signal and stop_signal(): return None, []
         print("--- Scan Complete ---")
-        return db_path
+        
+        # Return tuple: (DB Path, Skipped List)
+        return db_path, skipped_files_list

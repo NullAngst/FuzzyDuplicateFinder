@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog, 
                              QListWidget, QListWidgetItem, QSplitter, QMessageBox, 
                              QProgressBar, QFrame, QSizePolicy, QMenu, QTableWidget, 
-                             QTableWidgetItem, QHeaderView, QAbstractItemView, QSpinBox)
+                             QTableWidgetItem, QHeaderView, QAbstractItemView, QSpinBox,
+                             QDialog, QTextEdit)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QAction
 from send2trash import send2trash
@@ -26,9 +27,54 @@ def format_size(size_bytes):
     s = round(size_bytes / p, 2)
     return f"{s} {size_name[i]}"
 
+class SkippedFileDialog(QDialog):
+    def __init__(self, skipped_files, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Skipped Files")
+        self.resize(600, 400)
+        self.skipped_files = skipped_files
+        
+        layout = QVBoxLayout(self)
+        
+        lbl = QLabel(f"{len(skipped_files)} files could not be processed (Permission denied, corrupted, or unsupported):")
+        layout.addWidget(lbl)
+        
+        self.list_widget = QListWidget()
+        self.list_widget.addItems(skipped_files)
+        layout.addWidget(self.list_widget)
+        
+        btn_layout = QHBoxLayout()
+        btn_export = QPushButton("Export List to TXT")
+        btn_export.clicked.connect(self.export_list)
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.close)
+        
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_export)
+        btn_layout.addWidget(btn_close)
+        layout.addLayout(btn_layout)
+        
+        self.setStyleSheet("""
+            QDialog { background-color: #333; color: #eee; }
+            QListWidget { background-color: #222; color: #ccc; border: 1px solid #444; }
+            QPushButton { background-color: #444; color: white; padding: 6px 12px; border-radius: 4px; }
+            QPushButton:hover { background-color: #555; }
+        """)
+
+    def export_list(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Export Skipped Files", "skipped_files.txt", "Text Files (*.txt)")
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(self.skipped_files))
+                QMessageBox.information(self, "Export Successful", f"Saved to {path}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", str(e))
+
 class ScanAndMatchWorker(QThread):
     progress_update = pyqtSignal(str)
     progress_value = pyqtSignal(int, int) # current, total
+    scan_complete = pyqtSignal(list) # Emits skipped files
     finished = pyqtSignal(list)
     error = pyqtSignal(str)
     aborted = pyqtSignal()
@@ -60,16 +106,23 @@ class ScanAndMatchWorker(QThread):
             if not self.skip_scan:
                 self.progress_update.emit("Phase 1: Indexing files...")
                 scanner = Scanner()
-                db_path = scanner.scan_directory(
+                # Unpack tuple (db_path, skipped_list)
+                result_db, skipped_list = scanner.scan_directory(
                     self.folder_list, 
                     self.db_path, 
                     stop_signal=self.is_stopped,
                     progress_callback=self.on_scan_progress
                 )
+                
                 if self.is_stopped(): self.aborted.emit(); return
-                if not db_path: self.error.emit("DB Failed"); return
+                if not result_db: self.error.emit("DB Failed"); return
+                
+                # Update DB path just in case
+                self.db_path = result_db 
+                self.scan_complete.emit(skipped_list)
             else:
                 self.progress_update.emit("Skipping scan. Loading index...")
+                self.scan_complete.emit([]) # No new skips if we skipped scan
 
             self.progress_update.emit("Phase 2: Analyzing content...")
             matcher = Matcher(self.db_path)
@@ -111,6 +164,7 @@ class DuplicateFinderApp(QMainWindow):
 
         self.scan_folders = [] 
         self.matches = []
+        self.skipped_files = [] # Store skipped files here
         self.current_match_index = -1
         self.current_db_path = None
         self.worker = None
@@ -169,6 +223,16 @@ class DuplicateFinderApp(QMainWindow):
         self.lbl_status = QLabel("Ready")
         self.lbl_status.setStyleSheet("color: #aaa; margin-left: 10px; font-weight: bold;")
         
+        # New Skipped Files Button
+        self.btn_skipped = QPushButton("0 Skipped")
+        self.btn_skipped.setStyleSheet("""
+            QPushButton { background: transparent; color: #d32f2f; text-decoration: underline; border: none; font-weight: bold; text-align: left; }
+            QPushButton:hover { color: #ff6659; }
+        """)
+        self.btn_skipped.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_skipped.clicked.connect(self.show_skipped_dialog)
+        self.btn_skipped.hide()
+
         btn_row.addWidget(btn_add_folder)
         btn_row.addWidget(btn_clear_folders)
         btn_row.addWidget(btn_load_index)
@@ -176,6 +240,7 @@ class DuplicateFinderApp(QMainWindow):
         btn_row.addWidget(self.btn_scan)
         btn_row.addWidget(self.btn_stop)
         btn_row.addWidget(self.lbl_status)
+        btn_row.addWidget(self.btn_skipped)
         btn_row.addStretch()
 
         # Folder List Table
@@ -358,7 +423,10 @@ class DuplicateFinderApp(QMainWindow):
             spin = QSpinBox()
             spin.setRange(0, 100)
             spin.setValue(folder_data['priority'])
-            spin.setStyleSheet("background-color: #444; color: white; border: none;")
+            
+            # FIX: Removed 'border: none' to ensure up/down arrows are clickable/visible in all OS styles
+            spin.setStyleSheet("background-color: #444; color: white; border: 1px solid #555; padding: 2px;")
+            
             spin.valueChanged.connect(lambda val, idx=i: self.update_priority(idx, val))
             self.folder_table.setCellWidget(i, 1, spin)
 
@@ -380,6 +448,9 @@ class DuplicateFinderApp(QMainWindow):
     def start_worker(self, skip_scan=False):
         self.lbl_status.setText("Working...")
         self.match_list.clear()
+        self.btn_skipped.hide()
+        self.skipped_files = []
+        
         if not skip_scan:
             self.progress_bar.setRange(0, 0)
             self.progress_bar.show()
@@ -388,6 +459,7 @@ class DuplicateFinderApp(QMainWindow):
         self.worker = ScanAndMatchWorker(self.scan_folders, self.current_db_path, skip_scan=skip_scan)
         self.worker.progress_update.connect(lambda s: self.lbl_status.setText(s))
         self.worker.progress_value.connect(self.update_progress_bar)
+        self.worker.scan_complete.connect(self.on_scan_phase_complete)
         self.worker.finished.connect(self.on_process_complete)
         self.worker.aborted.connect(self.on_scan_aborted)
         self.worker.error.connect(self.on_error)
@@ -397,6 +469,17 @@ class DuplicateFinderApp(QMainWindow):
         self.progress_bar.show()
         self.progress_bar.setRange(0, total)
         self.progress_bar.setValue(current)
+
+    def on_scan_phase_complete(self, skipped_list):
+        self.skipped_files = skipped_list
+        if len(skipped_list) > 0:
+            self.btn_skipped.setText(f"{len(skipped_list)} Files Skipped (View)")
+            self.btn_skipped.show()
+
+    def show_skipped_dialog(self):
+        if not self.skipped_files: return
+        dlg = SkippedFileDialog(self.skipped_files, self)
+        dlg.exec()
 
     def stop_scan(self):
         if self.worker and self.worker.isRunning():
@@ -602,8 +685,11 @@ class DuplicateFinderApp(QMainWindow):
         if self.current_db_path and os.path.exists(self.current_db_path):
             reply = QMessageBox.question(self, "Cleanup", "Delete the index database file before exiting?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                try: os.remove(self.current_db_path)
-                except: pass
+                try: 
+                    # FIX: Use send2trash instead of os.remove
+                    send2trash(self.current_db_path)
+                except Exception as e: 
+                    print(f"Cleanup failed: {e}")
         event.accept()
 
 if __name__ == "__main__":
