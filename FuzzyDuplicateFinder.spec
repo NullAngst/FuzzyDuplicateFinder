@@ -57,7 +57,7 @@ exe = EXE(
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,
-    codesign_identity=None if not is_macos else 'Apple Development',
+    codesign_identity=None,  # Disable code signing during build
     entitlements_file=None,
 )
 
