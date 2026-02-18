@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.building.build_main import Analysis
-from PyInstaller.building.api import EXE, PYZ, COLLECT, BUNDLE
 import sys
+from PyInstaller.building.build_main import Analysis
+from PyInstaller.building.api import EXE, PYZ
 
 # Platform detection
 is_macos = sys.platform == 'darwin'
 is_windows = sys.platform == 'win32'
 is_linux = sys.platform.startswith('linux')
+
+# Only import BUNDLE on macOS
+if is_macos:
+    from PyInstaller.building.osx import BUNDLE
 
 a = Analysis(
     ['main.py'],
