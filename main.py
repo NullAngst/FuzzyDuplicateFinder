@@ -389,6 +389,7 @@ class DuplicateFinderApp(QMainWindow):
     # ... (Rest of the class methods remain the same: add_folder, start_scan, load_index, etc.) ...
     
     def add_folder(self):
+        """Add folders with native multi-select when available"""
         folder = QFileDialog.getExistingDirectory(self, "Select Directory")
         if folder:
             for f in self.scan_folders:
@@ -421,46 +422,73 @@ class DuplicateFinderApp(QMainWindow):
             path_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             self.folder_table.setItem(i, 0, path_item)
             
-            spin = QSpinBox()
-            spin.setRange(0, 100)
-            spin.setValue(folder_data['priority'])
+            # Create custom priority widget with arrow buttons
+            priority_widget = QWidget()
+            priority_layout = QHBoxLayout(priority_widget)
+            priority_layout.setContentsMargins(0, 0, 0, 0)
+            priority_layout.setSpacing(2)
             
-            # IMPROVED STYLESHEET: Draws arrows using CSS borders
-            spin.setStyleSheet("""
-                QSpinBox {
-                    background-color: #444; 
-                    color: white; 
-                    border: 1px solid #555; 
-                    padding: 2px;
-                }
-                /* Style the Clickable Buttons */
-                QSpinBox::up-button, QSpinBox::down-button {
+            # Display value
+            lbl_value = QLabel(str(folder_data['priority']))
+            lbl_value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl_value.setStyleSheet("color: white; font-weight: bold; min-width: 20px;")
+            
+            # Up arrow button
+            btn_up = QPushButton("▲")
+            btn_up.setMaximumWidth(20)
+            btn_up.setMaximumHeight(16)
+            btn_up.setStyleSheet("""
+                QPushButton {
                     background-color: #555;
-                    width: 16px;
-                    border-left: 1px solid #333;
+                    color: #fff;
+                    font-size: 10px;
+                    font-weight: bold;
+                    border: 1px solid #333;
+                    padding: 0px;
+                    border-radius: 2px;
                 }
-                QSpinBox::up-button:hover, QSpinBox::down-button:hover {
-                    background-color: #007acc;
-                }
-                /* Draw the Arrows */
-                QSpinBox::up-arrow, QSpinBox::down-arrow {
-                    width: 0px;
-                    height: 0px;
-                    border-left: 4px solid transparent;
-                    border-right: 4px solid transparent;
-                }
-                /* Up Arrow (Triangle pointing up) */
-                QSpinBox::up-arrow {
-                    border-bottom: 5px solid white;
-                }
-                /* Down Arrow (Triangle pointing down) */
-                QSpinBox::down-arrow {
-                    border-top: 5px solid white;
-                }
+                QPushButton:hover { background-color: #2196f3; }
+                QPushButton:pressed { background-color: #1976d2; }
             """)
             
-            spin.valueChanged.connect(lambda val, idx=i: self.update_priority(idx, val))
-            self.folder_table.setCellWidget(i, 1, spin)
+            # Down arrow button
+            btn_down = QPushButton("▼")
+            btn_down.setMaximumWidth(20)
+            btn_down.setMaximumHeight(16)
+            btn_down.setStyleSheet("""
+                QPushButton {
+                    background-color: #555;
+                    color: #fff;
+                    font-size: 10px;
+                    font-weight: bold;
+                    border: 1px solid #333;
+                    padding: 0px;
+                    border-radius: 2px;
+                }
+                QPushButton:hover { background-color: #2196f3; }
+                QPushButton:pressed { background-color: #1976d2; }
+            """)
+            
+            def on_up_clicked(idx=i):
+                if idx < len(self.scan_folders):
+                    new_val = min(100, self.scan_folders[idx]['priority'] + 1)
+                    self.scan_folders[idx]['priority'] = new_val
+                    lbl_value.setText(str(new_val))
+            
+            def on_down_clicked(idx=i):
+                if idx < len(self.scan_folders):
+                    new_val = max(0, self.scan_folders[idx]['priority'] - 1)
+                    self.scan_folders[idx]['priority'] = new_val
+                    lbl_value.setText(str(new_val))
+            
+            btn_up.clicked.connect(on_up_clicked)
+            btn_down.clicked.connect(on_down_clicked)
+            
+            priority_layout.addWidget(btn_down)
+            priority_layout.addWidget(lbl_value)
+            priority_layout.addWidget(btn_up)
+            
+            self.folder_table.setCellWidget(i, 1, priority_widget)
 
     def update_priority(self, index, value):
         if 0 <= index < len(self.scan_folders):
@@ -711,41 +739,78 @@ class DuplicateFinderApp(QMainWindow):
         super().resizeEvent(event)
 
     def closeEvent(self, event):
-        # 1. Ensure worker and threads are stopped
+        # 1) Stop worker and wait (process events while waiting)
         if self.worker and self.worker.isRunning():
             self.worker.stop()
-            self.worker.wait(1000) 
+            start = time.time()
+            while self.worker.isRunning() and (time.time() - start) < 5.0:
+                QApplication.processEvents()
+                time.sleep(0.05)
 
-        # 2. Database Cleanup
+        # 1.5) If you hold a DatabaseManager instance, close it here:
+        try:
+            if hasattr(self, "db") and self.db:
+                try:
+                    self.db.close()
+                except: pass
+        except: pass
+
+        # 2) Database cleanup prompt
         if self.current_db_path:
-            reply = QMessageBox.question(self, "Cleanup", 
-                                       "Delete the index database file before exiting?", 
-                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-            
+            reply = QMessageBox.question(self, "Cleanup",
+                                         "Delete the index database file before exiting?",
+                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
-                # SQLite creates temporary files that must also be deleted
-                files_to_remove = [
+                candidates = [
                     self.current_db_path,
                     self.current_db_path + "-shm",
                     self.current_db_path + "-wal"
                 ]
 
-                for raw_path in files_to_remove:
-                    # FIX: Strip the Windows extended path prefix if present.
-                    # send2trash often chokes on "\\?\"
-                    clean_path = raw_path.replace("\\\\?\\", "")
-                    
-                    if os.path.exists(clean_path):
+                for raw_path in candidates:
+                    # Safely strip Windows extended prefix only if present
+                    clean_path = raw_path
+                    if clean_path.startswith('\\\\?\\'):
+                        clean_path = clean_path[4:]
+
+                    # Normalize absolute path
+                    clean_path = os.path.abspath(clean_path)
+
+                    if not os.path.exists(clean_path):
+                        continue
+
+                    # Try to send to recycle bin, with a small retry loop and user options on failure
+                    tried = 0
+                    while tried < 3:
                         try:
                             send2trash(clean_path)
                             print(f"Sent to trash: {clean_path}")
-                        except Exception as e:
-                            print(f"Trash failed for {clean_path}: {e}")
-                            # OPTIONAL: Uncomment the next lines if you want to force delete 
-                            # when trash fails. Otherwise, leave it so it doesn't "nuke" files silently.
-                            # try:
-                            #    os.remove(clean_path)
-                            # except: pass
+                            break
+                        except Exception as exc:
+                            tried += 1
+                            # Ask the user what to do on final failure
+                            if tried >= 3:
+                                btn = QMessageBox.question(
+                                    self, "Failed to Move to Trash",
+                                    f"Failed to move to Recycle Bin:\n\n{clean_path}\n\nError: {exc}\n\nChoose:",
+                                    QMessageBox.StandardButton.Retry | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Yes
+                                )
+                                # Map: Retry -> Retry, No -> Skip, Yes -> Delete permanently
+                                if btn == QMessageBox.StandardButton.Retry:
+                                    tried = 0
+                                    continue
+                                elif btn == QMessageBox.StandardButton.Yes:
+                                    try:
+                                        os.remove(clean_path)
+                                        print(f"Permanently removed: {clean_path}")
+                                    except Exception as e2:
+                                        print(f"Permanent delete failed: {e2}")
+                                    break
+                                else:
+                                    # Skip
+                                    break
+                            else:
+                                time.sleep(0.1)
 
         event.accept()
 
