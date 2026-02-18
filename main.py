@@ -424,8 +424,29 @@ class DuplicateFinderApp(QMainWindow):
             spin.setRange(0, 100)
             spin.setValue(folder_data['priority'])
             
-            # FIX: Removed 'border: none' to ensure up/down arrows are clickable/visible in all OS styles
-            spin.setStyleSheet("background-color: #444; color: white; border: 1px solid #555; padding: 2px;")
+            # FIX: Explicitly style the buttons so they remain clickable
+            spin.setStyleSheet("""
+                QSpinBox {
+                    background-color: #444; 
+                    color: white; 
+                    border: 1px solid #555; 
+                    padding: 2px;
+                }
+                QSpinBox::up-button, QSpinBox::down-button {
+                    background-color: #555;
+                    width: 16px; /* Vital for clickability */
+                    border-left: 1px solid #333;
+                }
+                QSpinBox::up-button:hover, QSpinBox::down-button:hover {
+                    background-color: #007acc;
+                }
+                QSpinBox::up-arrow, QSpinBox::down-arrow {
+                    width: 8px;
+                    height: 8px;
+                }
+                QSpinBox::up-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-bottom: 4px solid white; }
+                QSpinBox::down-arrow { image: none; border-left: 4px solid transparent; border-right: 4px solid transparent; border-top: 4px solid white; }
+            """)
             
             spin.valueChanged.connect(lambda val, idx=i: self.update_priority(idx, val))
             self.folder_table.setCellWidget(i, 1, spin)
@@ -679,17 +700,44 @@ class DuplicateFinderApp(QMainWindow):
         super().resizeEvent(event)
 
     def closeEvent(self, event):
+        # 1. Stop the worker threads first
         if self.worker and self.worker.isRunning():
             self.worker.stop()
             self.worker.wait(1000) 
-        if self.current_db_path and os.path.exists(self.current_db_path):
-            reply = QMessageBox.question(self, "Cleanup", "Delete the index database file before exiting?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+
+        # 2. Ensure Database connections are fully closed
+        # (The worker's internal objects should be garbage collected, 
+        # but let's be safe before deleting files)
+        self.worker = None
+
+        if self.current_db_path:
+            reply = QMessageBox.question(self, "Cleanup", 
+                                       "Delete the index database file before exiting?", 
+                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+            
             if reply == QMessageBox.StandardButton.Yes:
-                try: 
-                    # FIX: Use send2trash instead of os.remove
-                    send2trash(self.current_db_path)
-                except Exception as e: 
-                    print(f"Cleanup failed: {e}")
+                # LIST OF FILES TO REMOVE (Main DB + SQLite temp files)
+                files_to_remove = [
+                    self.current_db_path,
+                    self.current_db_path + "-shm",
+                    self.current_db_path + "-wal"
+                ]
+
+                for raw_path in files_to_remove:
+                    # FIX: Strip the Windows long path prefix if present
+                    clean_path = raw_path.replace("\\\\?\\", "")
+                    
+                    if os.path.exists(clean_path):
+                        try:
+                            # Try trash first
+                            send2trash(clean_path)
+                        except Exception as e:
+                            # If trash fails (e.g. permission or network drive), try force delete
+                            try:
+                                os.remove(clean_path)
+                            except:
+                                print(f"Could not delete {clean_path}: {e}")
+        
         event.accept()
 
 if __name__ == "__main__":

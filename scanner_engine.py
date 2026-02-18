@@ -200,6 +200,15 @@ class Scanner:
         self.db = DatabaseManager(db_path)
         self.db.save_roots(folder_list)
         
+        # FIX: Identify the files to ignore based on the active db_path
+        db_filename = os.path.basename(db_path)
+        ignored_files = {
+            db_filename, 
+            db_filename + "-shm", 
+            db_filename + "-wal",
+            "duplicate_index.db" # Keep the default legacy ignore just in case
+        }
+
         files_to_process = []
         for root_dir in folder_list:
             if stop_signal and stop_signal(): break
@@ -209,7 +218,10 @@ class Scanner:
             for root, dirs, files in os.walk(path_str):
                 if stop_signal and stop_signal(): break
                 for file in files:
-                    if file == "duplicate_index.db": continue
+                    # FIX: Check against the set of ignored DB files
+                    if file in ignored_files: 
+                        continue
+                        
                     files_to_process.append(os.path.join(root, file))
 
         total_files = len(files_to_process)
