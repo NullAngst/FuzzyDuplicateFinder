@@ -469,18 +469,18 @@ class DuplicateFinderApp(QMainWindow):
                 QPushButton:pressed { background-color: #1976d2; }
             """)
             
-            def on_up_clicked(idx=i):
+            def on_up_clicked(idx=i, label=lbl_value):
                 if idx < len(self.scan_folders):
                     new_val = min(100, self.scan_folders[idx]['priority'] + 1)
                     self.scan_folders[idx]['priority'] = new_val
-                    lbl_value.setText(str(new_val))
-            
-            def on_down_clicked(idx=i):
+                    label.setText(str(new_val))
+
+            def on_down_clicked(idx=i, label=lbl_value):
                 if idx < len(self.scan_folders):
                     new_val = max(0, self.scan_folders[idx]['priority'] - 1)
                     self.scan_folders[idx]['priority'] = new_val
-                    lbl_value.setText(str(new_val))
-            
+                    label.setText(str(new_val))
+
             btn_up.clicked.connect(on_up_clicked)
             btn_down.clicked.connect(on_down_clicked)
             
