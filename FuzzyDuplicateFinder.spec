@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_submodules, collect_data_files
-from PyInstaller.building.api import EXE, PYZ, Analysis, COLLECT
-from PyInstaller.building.datastruct import Tree, TOC
+from PyInstaller.building.build_main import Analysis
+from PyInstaller.building.api import EXE, PYZ, COLLECT, BUNDLE
 import sys
 
 # Platform detection
@@ -48,29 +47,26 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=is_windows,  # Only use UPX on Windows
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
     disable_windowed_traceback=False,
     target_arch=None,
-    codesign_identity=None,
+    codesign_identity=None if not is_macos else 'Apple Development',
     entitlements_file=None,
 )
 
-coll = Collection(
-    exe,
-    name='FuzzyDuplicateFinder',
-)
-
-app = BUNDLE(
-    coll,
-    name='FuzzyDuplicateFinder.app',
-    icon=None,
-    bundle_identifier='com.fuzzyduplicate.finder',
-    info_plist={
-        'NSPrincipalClass': 'NSApplication',
-        'NSHighResolutionCapable': 'True',
-    },
-    codesign_identity=None,
-)
+# Only create BUNDLE on macOS
+if is_macos:
+    app = BUNDLE(
+        exe,
+        name='FuzzyDuplicateFinder.app',
+        icon=None,
+        bundle_identifier='com.fuzzyduplicate.finder',
+        info_plist={
+            'NSPrincipalClass': 'NSApplication',
+            'NSHighResolutionCapable': 'True',
+        },
+        codesign_identity=None,
+    )
