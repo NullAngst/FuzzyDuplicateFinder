@@ -1,7 +1,7 @@
-PyQt6==6.10.0
-opencv-python==4.10.0.72
-imagehash==4.3.1
-Pillow==10.2.0
-send2trash==1.8.2
-numpy==1.26.4
-librosa==0.10.1
+PyQt6==6.11.0
+opencv-python==4.13.0.92
+imagehash==4.3.2
+Pillow==12.1.1
+send2trash==2.1.0
+numpy==2.4.4
+librosa==0.11.0
