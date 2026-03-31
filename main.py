@@ -570,7 +570,33 @@ class DuplicateFinderApp(QMainWindow):
              else:
                 save_path, _ = QFileDialog.getSaveFileName(self, "Save Database Location", "duplicate_index.db", "Database Files (*.db)")
                 if save_path: self.current_db_path = save_path
-                else: return 
+                else: return
+        
+        # Check if database already exists and ask user to confirm overwrite
+        if os.path.exists(self.current_db_path):
+            confirm = QMessageBox.question(
+                self,
+                "Database Exists",
+                f"Database already exists at:\n\n{self.current_db_path}\n\nOverwrite and start fresh scan?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            
+            # Delete existing database and WAL files
+            db_files = [
+                self.current_db_path,
+                self.current_db_path + "-shm",
+                self.current_db_path + "-wal"
+            ]
+            for db_file in db_files:
+                try:
+                    if os.path.exists(db_file):
+                        os.remove(db_file)
+                except Exception as e:
+                    QMessageBox.warning(self, "Warning", f"Could not delete old database file: {e}")
+                    return
+        
         self.start_worker(skip_scan=False)
 
     def start_worker(self, skip_scan=False):
@@ -860,15 +886,29 @@ class DuplicateFinderApp(QMainWindow):
         self.prune_worker.start()
 
     def _update_prune_progress(self, current, total):
-        if self.prune_progress_dialog:
-            self.prune_progress_dialog.setMaximum(total)
-            self.prune_progress_dialog.setValue(current)
-            self.prune_progress_dialog.setLabelText(f"Pruning: {current} / {total} files")
+        dialog = self.prune_progress_dialog
+        if not dialog:
+            return
+        try:
+            dialog.setMaximum(total)
+            dialog.setValue(current)
+            dialog.setLabelText(f"Pruning: {current} / {total} files")
+        except (RuntimeError, AttributeError):
+            # Dialog was closed or garbage collected, ignore stale signal
+            pass
 
     def _close_prune_progress_dialog(self):
         if self.prune_progress_dialog:
             self.prune_progress_dialog.close()
             self.prune_progress_dialog = None
+        
+        # Disconnect worker signals to prevent stale emissions
+        if self.prune_worker:
+            try:
+                self.prune_worker.progress_value.disconnect()
+            except TypeError:
+                # Signal already disconnected or not connected
+                pass
 
     def on_prune_complete(self, deleted_count):
         """Called when auto-prune finishes"""
