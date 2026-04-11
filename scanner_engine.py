@@ -10,6 +10,8 @@ import imagehash
 from PIL import Image
 import numpy as np
 
+MAX_SCAN_WORKERS = min(16, max(4, (os.cpu_count() or 4) * 2))
+
 # Suppress OpenCV console spam
 os.environ["OPENCV_LOG_LEVEL"] = "OFF"
 
@@ -243,7 +245,8 @@ class Scanner:
         skipped_count = 0
         skipped_files_list = []
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        worker_count = min(MAX_SCAN_WORKERS, max(1, (os.cpu_count() or 4) * 2))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
             future_to_file = {executor.submit(self.process_file, fp): fp for fp in files_to_process}
             
             for future in concurrent.futures.as_completed(future_to_file):

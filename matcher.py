@@ -1,15 +1,102 @@
 import sqlite3
 import imagehash
 import os
+import concurrent.futures
 from difflib import SequenceMatcher
 
 # --- CONFIGURATION ---
 SIMILARITY_THRESHOLD = 70.0 
+MAX_MATCH_WORKERS = max(1, min(8, os.cpu_count() or 4))
 
 # Must match Scanner Engine extensions
 VISUAL_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif', '.psd', '.raw',
                '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.m4v', '.webm', '.ts', '.mts', '.3gp'}
 AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.wma'}
+
+
+def _pair_range_count(start, end, n):
+    # Count comparisons for i in [start, end)
+    total = 0
+    for i in range(start, end):
+        total += max(0, n - i - 1)
+    return total
+
+
+def _compare_range(files, start, end, similarity_threshold):
+    matches = []
+    n = len(files)
+
+    for i in range(start, end):
+        f1 = files[i]
+        is_aud_1 = f1['extension'] in AUDIO_EXTS
+        is_vis_1 = f1['extension'] in VISUAL_EXTS
+
+        for j in range(i + 1, n):
+            f2 = files[j]
+            is_aud_2 = f2['extension'] in AUDIO_EXTS
+            is_vis_2 = f2['extension'] in VISUAL_EXTS
+
+            if (is_aud_1 != is_aud_2) and (f1['filename'] != f2['filename']):
+                continue
+            if (is_vis_1 != is_vis_2) and (f1['filename'] != f2['filename']):
+                continue
+
+            score = _calculate_score_local(f1, f2)
+            if score >= similarity_threshold:
+                matches.append({
+                    'file_a': f1['path'],
+                    'file_b': f2['path'],
+                    'score': score
+                })
+
+    return matches
+
+
+def _calculate_score_local(f1, f2):
+    # Duplicate the same scoring logic as Matcher.calculate_score to keep worker functions pickle-safe.
+    is_visual = f1['extension'] in VISUAL_EXTS
+    has_visual_hashes = f1['visual_hash'] and f2['visual_hash']
+
+    if is_visual and not has_visual_hashes:
+        return 0
+
+    score = 0
+    total_weight = 0
+
+    if has_visual_hashes:
+        try:
+            h1 = imagehash.hex_to_hash(f1['visual_hash'])
+            h2 = imagehash.hex_to_hash(f2['visual_hash'])
+            dist = h1 - h2
+            sim = max(0, (10 - dist) / 10) * 100
+            score += sim * 0.50
+            total_weight += 0.50
+        except: pass
+
+    if f1['audio_hash'] and f2['audio_hash']:
+        if f1['audio_hash'] == f2['audio_hash']:
+            score += 100 * 0.50
+        total_weight += 0.50
+
+    if f1['filename'] and f2['filename']:
+        name_sim = SequenceMatcher(None, f1['filename'], f2['filename']).ratio() * 100
+        score += name_sim * 0.20
+        total_weight += 0.20
+
+    size_a, size_b = f1['size'], f2['size']
+    if size_a > 0 and size_b > 0:
+        size_sim = (1 - (abs(size_a - size_b) / max(size_a, size_b))) * 100
+        score += size_sim * 0.10
+        total_weight += 0.10
+
+    if f1['extension'] == f2['extension']:
+        score += 100 * 0.05
+        total_weight += 0.05
+
+    if total_weight == 0:
+        return 0
+    return round(score / total_weight, 1)
+
 
 class Matcher:
     def __init__(self, db_path):
@@ -108,36 +195,49 @@ class Matcher:
         potential_matches = []
         n = len(files)
         
+        if n < 2:
+            self.close()
+            return []
+
         total_comparisons = (n * (n - 1)) // 2
         current_comparison = 0
-        
-        for i in range(n):
-            if stop_signal and stop_signal(): break
-            
-            if progress_callback and i % 10 == 0:
-                progress_callback(current_comparison, total_comparisons)
 
-            for j in range(i + 1, n):
-                current_comparison += 1
-                
-                f1, f2 = files[i], files[j]
-                
-                # Basic Type Check
-                is_aud_1 = f1['extension'] in AUDIO_EXTS
-                is_aud_2 = f2['extension'] in AUDIO_EXTS
-                is_vis_1 = f1['extension'] in VISUAL_EXTS
-                is_vis_2 = f2['extension'] in VISUAL_EXTS
+        worker_count = min(MAX_MATCH_WORKERS, max(1, n - 1))
+        chunk_size = max(1, n // (worker_count * 4))
+        ranges = []
+        start = 0
+        while start < n - 1:
+            end = min(n - 1, start + chunk_size)
+            ranges.append((start, end))
+            start = end
 
-                if (is_aud_1 != is_aud_2) and (f1['filename'] != f2['filename']): continue
-                if (is_vis_1 != is_vis_2) and (f1['filename'] != f2['filename']): continue
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=worker_count)
+        try:
+            future_to_range = {
+                executor.submit(_compare_range, files, start, end, SIMILARITY_THRESHOLD): (start, end)
+                for start, end in ranges
+            }
 
-                score = self.calculate_score(f1, f2)
-                if score >= SIMILARITY_THRESHOLD:
-                    potential_matches.append({
-                        'file_a': f1['path'],
-                        'file_b': f2['path'],
-                        'score': score
-                    })
-        
+            for future in concurrent.futures.as_completed(future_to_range):
+                if stop_signal and stop_signal():
+                    break
+
+                try:
+                    matches = future.result()
+                    potential_matches.extend(matches)
+                except Exception:
+                    pass
+
+                start, end = future_to_range[future]
+                current_comparison += _pair_range_count(start, end, n)
+                if progress_callback:
+                    progress_callback(current_comparison, total_comparisons)
+
+            if stop_signal and stop_signal():
+                for future in future_to_range:
+                    future.cancel()
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
+
         self.close()
         return potential_matches

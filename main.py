@@ -22,7 +22,7 @@ from scanner_engine import Scanner, DatabaseManager
 from matcher import Matcher
 
 # --- VERSION INFO ---
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 GITHUB_URL = "https://github.com/MZGSZM/FuzzyDuplicateFinder"
 
 def format_size(size_bytes):
