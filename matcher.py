@@ -203,7 +203,8 @@ class Matcher:
         current_comparison = 0
 
         worker_count = min(MAX_MATCH_WORKERS, max(1, n - 1))
-        chunk_size = max(1, n // (worker_count * 4))
+        # Smaller chunks = more frequent progress updates and better stop responsiveness
+        chunk_size = max(1, n // (worker_count * 16))
         ranges = []
         start = 0
         while start < n - 1:
@@ -211,31 +212,32 @@ class Matcher:
             ranges.append((start, end))
             start = end
 
-        executor = concurrent.futures.ProcessPoolExecutor(max_workers=worker_count)
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+        futures_submitted = []
         try:
-            future_to_range = {
-                executor.submit(_compare_range, files, start, end, SIMILARITY_THRESHOLD): (start, end)
-                for start, end in ranges
-            }
-
-            for future in concurrent.futures.as_completed(future_to_range):
+            for start, end in ranges:
                 if stop_signal and stop_signal():
                     break
+                
+                future = executor.submit(_compare_range, files, start, end, SIMILARITY_THRESHOLD)
+                futures_submitted.append((future, start, end))
 
+            for future, start, end in futures_submitted:
+                if stop_signal and stop_signal():
+                    break
+                
                 try:
-                    matches = future.result()
+                    matches = future.result(timeout=30)
                     potential_matches.extend(matches)
+                except concurrent.futures.CancelledError:
+                    pass
                 except Exception:
                     pass
 
-                start, end = future_to_range[future]
                 current_comparison += _pair_range_count(start, end, n)
                 if progress_callback:
                     progress_callback(current_comparison, total_comparisons)
 
-            if stop_signal and stop_signal():
-                for future in future_to_range:
-                    future.cancel()
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
