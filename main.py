@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QFileDialog,
                              QListWidget, QListWidgetItem, QSplitter, QMessageBox,
                              QProgressBar, QFrame, QSizePolicy, QMenu, QTableWidget,
-                             QTableWidgetItem, QHeaderView, QAbstractItemView, QSpinBox,
+                             QTableWidgetItem, QHeaderView, QAbstractItemView,
                              QDialog, QTextEdit, QProgressDialog)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QPixmap, QImage, QAction
@@ -261,6 +261,68 @@ class AutoPruneWorker(QThread):
                 self.error.emit(str(e))
 
 
+class ThreadCountWidget(QWidget):
+    """
+    A ▼ value ▲ stepper widget that matches the folder-priority arrow buttons exactly.
+    Exposes .value() so it can be used as a drop-in for the QSpinBox it replaces.
+    """
+
+    _ARROW_STYLE = """
+        QPushButton {
+            background-color: #555; color: #fff;
+            font-size: 10px; font-weight: bold;
+            border: 1px solid #333; padding: 0px; border-radius: 2px;
+        }
+        QPushButton:hover   { background-color: #2196f3; }
+        QPushButton:pressed { background-color: #1976d2; }
+    """
+
+    def __init__(self, min_val=1, max_val=8, default=4, parent=None):
+        super().__init__(parent)
+        self._value = max(min_val, min(default, max_val))
+        self._min   = min_val
+        self._max   = max_val
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        btn_down = QPushButton("▼")
+        btn_down.setMaximumWidth(20)
+        btn_down.setMaximumHeight(16)
+        btn_down.setStyleSheet(self._ARROW_STYLE)
+        btn_down.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_down.clicked.connect(self._decrement)
+
+        self._lbl = QLabel(str(self._value))
+        self._lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl.setStyleSheet("color: white; font-weight: bold; min-width: 26px;")
+
+        btn_up = QPushButton("▲")
+        btn_up.setMaximumWidth(20)
+        btn_up.setMaximumHeight(16)
+        btn_up.setStyleSheet(self._ARROW_STYLE)
+        btn_up.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_up.clicked.connect(self._increment)
+
+        layout.addWidget(btn_down)
+        layout.addWidget(self._lbl)
+        layout.addWidget(btn_up)
+
+    def _increment(self):
+        if self._value < self._max:
+            self._value += 1
+            self._lbl.setText(str(self._value))
+
+    def _decrement(self):
+        if self._value > self._min:
+            self._value -= 1
+            self._lbl.setText(str(self._value))
+
+    def value(self):
+        return self._value
+
+
 class DuplicateFinderApp(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -352,39 +414,16 @@ class DuplicateFinderApp(QMainWindow):
         lbl_threads = QLabel("Threads:")
         lbl_threads.setStyleSheet("color: #aaa; font-size: 12px;")
 
-        self.spin_workers = QSpinBox()
-        self.spin_workers.setRange(1, (os.cpu_count() or 4) * 2)
-        self.spin_workers.setValue(os.cpu_count() or 4)
+        cpu_count = os.cpu_count() or 4
+        self.spin_workers = ThreadCountWidget(
+            min_val=1,
+            max_val=cpu_count * 2,
+            default=cpu_count,
+        )
         self.spin_workers.setToolTip(
             "Maximum worker threads for scanning and matching.\n"
-            f"Your system reports {os.cpu_count() or '?'} logical CPU core(s)."
+            f"Your system reports {cpu_count} logical CPU core(s)."
         )
-        self.spin_workers.setFixedWidth(80)
-        self.spin_workers.setStyleSheet("""
-            QSpinBox {
-                background-color: #333; color: #eee;
-                border: 1px solid #555; border-radius: 3px;
-                padding: 2px 4px;
-            }
-            QSpinBox::up-button {
-                background-color: #555;
-                border: none; border-left: 1px solid #333; border-bottom: 1px solid #333;
-                width: 20px;
-                subcontrol-position: top right; subcontrol-origin: border;
-            }
-            QSpinBox::up-button:hover   { background-color: #2196f3; }
-            QSpinBox::up-button:pressed { background-color: #1976d2; }
-            QSpinBox::down-button {
-                background-color: #555;
-                border: none; border-left: 1px solid #333; border-top: 1px solid #333;
-                width: 20px;
-                subcontrol-position: bottom right; subcontrol-origin: border;
-            }
-            QSpinBox::down-button:hover   { background-color: #2196f3; }
-            QSpinBox::down-button:pressed { background-color: #1976d2; }
-            QSpinBox::up-arrow   { width: 9px; height: 9px; }
-            QSpinBox::down-arrow { width: 9px; height: 9px; }
-        """)
 
         btn_row.addWidget(btn_add_folder)
         btn_row.addWidget(btn_clear_folders)
