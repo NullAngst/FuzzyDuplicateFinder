@@ -23,7 +23,7 @@ from scanner_engine import IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS
 from matcher import Matcher
 
 # Version Info
-VERSION = "1.4.0"
+VERSION = "1.3.0"
 GITHUB_URL = "https://github.com/MZGSZM/FuzzyDuplicateFinder"
 
 # Consolidated extension sets used by the UI (kept in sync with scanner_engine)
