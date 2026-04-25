@@ -117,11 +117,12 @@ class ScanAndMatchWorker(QThread):
     error           = pyqtSignal(str)
     aborted         = pyqtSignal()
 
-    def __init__(self, folder_list, db_path, skip_scan=False):
+    def __init__(self, folder_list, db_path, skip_scan=False, max_workers=None):
         super().__init__()
         self.folder_list = folder_list
         self.db_path     = db_path
         self.skip_scan   = skip_scan
+        self.max_workers = max_workers
         self._is_running = True
 
     def stop(self):
@@ -151,6 +152,7 @@ class ScanAndMatchWorker(QThread):
                     self.db_path,
                     stop_signal=self.is_stopped,
                     progress_callback=self.on_scan_progress,
+                    max_workers=self.max_workers,
                 )
 
                 if self.is_stopped():
@@ -178,6 +180,7 @@ class ScanAndMatchWorker(QThread):
             fuzzy = matcher.find_fuzzy_matches(
                 stop_signal=self.is_stopped,
                 progress_callback=self.on_match_progress,
+                max_workers=self.max_workers,
             )
 
             if self.is_stopped():
@@ -345,6 +348,23 @@ class DuplicateFinderApp(QMainWindow):
         self.btn_skipped.clicked.connect(self.show_skipped_dialog)
         self.btn_skipped.hide()
 
+        lbl_threads = QLabel("Threads:")
+        lbl_threads.setStyleSheet("color: #aaa; font-size: 12px;")
+
+        self.spin_workers = QSpinBox()
+        self.spin_workers.setRange(1, (os.cpu_count() or 4) * 2)
+        self.spin_workers.setValue(os.cpu_count() or 4)
+        self.spin_workers.setToolTip(
+            "Maximum worker threads used during scanning and matching.\n"
+            f"Your system reports {os.cpu_count() or '?'} logical CPU core(s)."
+        )
+        self.spin_workers.setFixedWidth(55)
+        self.spin_workers.setStyleSheet(
+            "QSpinBox { background-color: #333; color: #eee; border: 1px solid #555; "
+            "border-radius: 3px; padding: 2px 4px; } "
+            "QSpinBox::up-button, QSpinBox::down-button { background: #444; } "
+        )
+
         btn_row.addWidget(btn_add_folder)
         btn_row.addWidget(btn_clear_folders)
         btn_row.addWidget(btn_load_index)
@@ -353,6 +373,8 @@ class DuplicateFinderApp(QMainWindow):
         btn_row.addWidget(self.btn_stop)
         btn_row.addWidget(self.btn_skipped)
         btn_row.addStretch()
+        btn_row.addWidget(lbl_threads)
+        btn_row.addWidget(self.spin_workers)
 
         self.folder_table = QTableWidget()
         self.folder_table.setColumnCount(2)
@@ -708,7 +730,8 @@ class DuplicateFinderApp(QMainWindow):
         self.btn_stop.setEnabled(True)
 
         self.worker = ScanAndMatchWorker(
-            self.scan_folders, self.current_db_path, skip_scan=skip_scan
+            self.scan_folders, self.current_db_path, skip_scan=skip_scan,
+            max_workers=self.spin_workers.value()
         )
         self.worker.progress_update.connect(lambda s: self.lbl_status.setText(s))
         self.worker.progress_value.connect(self.update_progress_bar)
@@ -969,6 +992,14 @@ class DuplicateFinderApp(QMainWindow):
         """
         Remove the current match from both self.matches and the list widget,
         then advance to the next item (or show 'Done' if none remain).
+
+        FIXED BUG: Previously used blockSignals(True) during takeItem. Qt
+        silently moves the internal selection to the next row while signals are
+        blocked, so the subsequent setCurrentRow(new_row) finds the list already
+        at new_row and emits no currentRowChanged signal -- meaning
+        load_match_details is never called and the preview stays stale.
+        Fix: disconnect the slot instead, remove the item, reconnect, then call
+        load_match_details explicitly so it always runs exactly once.
         """
         idx = self.current_match_index
         if idx < 0 or idx >= len(self.matches):
@@ -977,20 +1008,28 @@ class DuplicateFinderApp(QMainWindow):
         # Remove from data model
         del self.matches[idx]
 
-        # Block signals so currentRowChanged doesn't fire mid-removal
-        self.match_list.blockSignals(True)
+        # Disconnect to prevent any premature or duplicate handler calls
+        # during takeItem and the subsequent setCurrentRow.
+        self.match_list.currentRowChanged.disconnect(self.load_match_details)
         self.match_list.takeItem(idx)
-        self.match_list.blockSignals(False)
 
         if not self.matches:
+            self.match_list.currentRowChanged.connect(self.load_match_details)
             self.current_match_index = -1
             QMessageBox.information(self, "Done", "No more matches!")
             return
 
         # Stay at the same index if possible, otherwise go to the last item
         new_row = min(idx, len(self.matches) - 1)
-        self.current_match_index = -1  # reset so load_match_details doesn't bail early
+        self.current_match_index = -1
         self.match_list.setCurrentRow(new_row)
+
+        # Reconnect before the explicit call so future navigation works normally
+        self.match_list.currentRowChanged.connect(self.load_match_details)
+
+        # Always call explicitly: setCurrentRow above may not emit
+        # currentRowChanged when Qt already moved selection to new_row.
+        self.load_match_details(new_row)
 
     def next_match(self):
         """Skip the current match without deleting anything."""
