@@ -359,12 +359,32 @@ class DuplicateFinderApp(QMainWindow):
             "Maximum worker threads for scanning and matching.\n"
             f"Your system reports {os.cpu_count() or '?'} logical CPU core(s)."
         )
-        self.spin_workers.setFixedWidth(55)
-        self.spin_workers.setStyleSheet(
-            "QSpinBox { background-color: #333; color: #eee; border: 1px solid #555; "
-            "border-radius: 3px; padding: 2px 4px; } "
-            "QSpinBox::up-button, QSpinBox::down-button { background: #444; }"
-        )
+        self.spin_workers.setFixedWidth(80)
+        self.spin_workers.setStyleSheet("""
+            QSpinBox {
+                background-color: #333; color: #eee;
+                border: 1px solid #555; border-radius: 3px;
+                padding: 2px 4px;
+            }
+            QSpinBox::up-button {
+                background-color: #555;
+                border: none; border-left: 1px solid #333; border-bottom: 1px solid #333;
+                width: 20px;
+                subcontrol-position: top right; subcontrol-origin: border;
+            }
+            QSpinBox::up-button:hover   { background-color: #2196f3; }
+            QSpinBox::up-button:pressed { background-color: #1976d2; }
+            QSpinBox::down-button {
+                background-color: #555;
+                border: none; border-left: 1px solid #333; border-top: 1px solid #333;
+                width: 20px;
+                subcontrol-position: bottom right; subcontrol-origin: border;
+            }
+            QSpinBox::down-button:hover   { background-color: #2196f3; }
+            QSpinBox::down-button:pressed { background-color: #1976d2; }
+            QSpinBox::up-arrow   { width: 9px; height: 9px; }
+            QSpinBox::down-arrow { width: 9px; height: 9px; }
+        """)
 
         btn_row.addWidget(btn_add_folder)
         btn_row.addWidget(btn_clear_folders)
@@ -1015,6 +1035,11 @@ class DuplicateFinderApp(QMainWindow):
         new_row = min(idx, len(self.matches) - 1)
         self.current_match_index = -1  # reset so load_match_details doesn't bail early
         self.match_list.setCurrentRow(new_row)
+        # Qt won't emit currentRowChanged when the selected row index hasn't changed
+        # (e.g. deleting a non-last item causes the next item to slide into the same
+        # position). Calling load_match_details explicitly guarantees the panels always
+        # reflect the new current match regardless of whether the signal fired.
+        self.load_match_details(new_row)
 
     def next_match(self):
         """Skip the current match without deleting anything."""
