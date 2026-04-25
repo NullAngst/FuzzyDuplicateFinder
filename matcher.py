@@ -31,21 +31,22 @@ def _file_type_group(ext):
     return 'other'
 
 
-def _compare_range(files, start, end, similarity_threshold, exact_hashes, stop_signal=None):
+def _compare_range(files, start, end, similarity_threshold, exact_hashes):
     """
     Compare files[start:end] against files[i+1:n].
 
     exact_hashes: set of exact_hash values that already have exact duplicates.
     Pairs whose files share the same exact_hash are skipped here because they
     will already be reported as EXACT matches, not fuzzy ones.
+
+    NOTE: stop_signal is intentionally absent. This function runs inside a
+    subprocess (ProcessPoolExecutor) and bound methods cannot be pickled.
+    Early exit on stop is handled by the caller between chunk completions.
     """
     matches = []
     n = len(files)
 
     for i in range(start, end):
-        if stop_signal and stop_signal():
-            break
-
         f1 = files[i]
         type1 = _file_type_group(f1['extension'])
 
@@ -165,13 +166,21 @@ class Matcher:
 
     def find_fuzzy_matches(self, stop_signal=None, progress_callback=None, max_workers=None):
         """
-        Multi-threaded fuzzy comparison across all indexed files.
+        Multi-process fuzzy comparison across all indexed files.
 
-        FIXED BUG: The original code passed a list of (future, start, end) tuples
-        directly to as_completed(), which expects an iterable of Future objects only.
-        That raised AttributeError on ._condition and silently killed all fuzzy
-        matching -- the feature never worked. Fixed by maintaining a plain future
-        list for as_completed and a separate dict for progress tracking.
+        FIXED BUG (original): The original code passed a list of (future, start, end)
+        tuples directly to as_completed(), raising AttributeError on ._condition and
+        silently killing all fuzzy matching. Fixed by maintaining a plain future list
+        for as_completed and a separate dict for progress tracking.
+
+        FIXED BUG (threading): ThreadPoolExecutor gave no real parallelism here
+        because _calculate_score_local is CPU-bound pure Python and the GIL
+        serializes all threads. Switched to ProcessPoolExecutor so each worker runs
+        in its own interpreter with its own GIL and comparisons execute in parallel.
+
+        stop_signal is checked between chunk completions in the outer loop but is
+        NOT passed into _compare_range -- bound methods cannot be pickled and
+        therefore cannot cross the process boundary.
         """
         files = self.fetch_all_files()
         n = len(files)
@@ -196,7 +205,13 @@ class Matcher:
             if max_workers and max_workers > 0
             else min(MAX_MATCH_WORKERS, max(1, n - 1))
         )
-        chunk_size = max(1, n // (worker_count * 16))
+
+        # Each chunk submission serializes the full files list and sends it to a
+        # worker process. Fewer, larger chunks keep that overhead manageable while
+        # still giving the scheduler enough work units for reasonable load-balancing.
+        # 4 chunks per worker is the practical sweet spot.
+        chunk_count = min(worker_count * 4, n - 1)
+        chunk_size  = max(1, -(-( n - 1) // chunk_count))  # ceiling division
 
         ranges = []
         start = 0
@@ -205,13 +220,9 @@ class Matcher:
             ranges.append((start, end))
             start = end
 
-        # Process smaller (later-index) chunks first for smoother early progress
-        ranges = ranges[::-1]
-
         potential_matches = []
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=worker_count)
 
-        # Plain list of futures for as_completed; separate dict for range lookup
         future_list = []
         future_to_range = {}
 
@@ -221,7 +232,8 @@ class Matcher:
                     break
                 future = executor.submit(
                     _compare_range, files, s, e,
-                    SIMILARITY_THRESHOLD, exact_hashes, stop_signal
+                    SIMILARITY_THRESHOLD, exact_hashes
+                    # stop_signal intentionally omitted -- not picklable
                 )
                 future_list.append(future)
                 future_to_range[future] = (s, e)
@@ -234,7 +246,7 @@ class Matcher:
                     break
 
                 try:
-                    matches = future.result(timeout=10)
+                    matches = future.result(timeout=120)
                     potential_matches.extend(matches)
                 except concurrent.futures.CancelledError:
                     pass
