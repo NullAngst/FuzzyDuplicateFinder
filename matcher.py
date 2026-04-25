@@ -5,44 +5,61 @@ import concurrent.futures
 from difflib import SequenceMatcher
 
 # Configuration variables
-SIMILARITY_THRESHOLD = 70.0 
+SIMILARITY_THRESHOLD = 70.0
 MAX_MATCH_WORKERS = max(1, min(8, os.cpu_count() or 4))
 
 # Must match Scanner Engine extensions
 VISUAL_EXTS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.webp', '.tiff', '.tif', '.psd', '.raw',
                '.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.m4v', '.webm', '.ts', '.mts', '.3gp'}
 AUDIO_EXTS = {'.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.wma'}
+TEXT_EXTS  = {'.txt', '.md', '.py', '.js', '.json', '.html', '.css', '.c', '.cpp'}
+
 
 def _pair_range_count(start, end, n):
-    # Count comparisons for i in the range of start to end
+    """Count total pair comparisons for rows [start, end) against the rest."""
     total = 0
     for i in range(start, end):
         total += max(0, n - i - 1)
     return total
 
-def _compare_range(files, start, end, similarity_threshold, stop_signal=None):
-    # Compares a subset of files against the rest of the list.
-    # Includes a stop_signal check to exit immediately if the user aborts.
+
+def _file_type_group(ext):
+    """Return a coarse type bucket so we never compare across media categories."""
+    if ext in VISUAL_EXTS: return 'visual'
+    if ext in AUDIO_EXTS:  return 'audio'
+    if ext in TEXT_EXTS:   return 'text'
+    return 'other'
+
+
+def _compare_range(files, start, end, similarity_threshold, exact_hashes, stop_signal=None):
+    """
+    Compare files[start:end] against files[i+1:n].
+
+    exact_hashes: set of exact_hash values that already have exact duplicates.
+    Pairs whose files share the same exact_hash are skipped here because they
+    will already be reported as EXACT matches, not fuzzy ones.
+    """
     matches = []
     n = len(files)
 
     for i in range(start, end):
-        # Abort if the user clicked stop
         if stop_signal and stop_signal():
             break
-            
+
         f1 = files[i]
-        is_aud_1 = f1['extension'] in AUDIO_EXTS
-        is_vis_1 = f1['extension'] in VISUAL_EXTS
+        type1 = _file_type_group(f1['extension'])
 
         for j in range(i + 1, n):
             f2 = files[j]
-            is_aud_2 = f2['extension'] in AUDIO_EXTS
-            is_vis_2 = f2['extension'] in VISUAL_EXTS
 
-            if (is_aud_1 != is_aud_2) and (f1['filename'] != f2['filename']):
+            # Never cross media type boundaries
+            if type1 != _file_type_group(f2['extension']):
                 continue
-            if (is_vis_1 != is_vis_2) and (f1['filename'] != f2['filename']):
+
+            # Skip pairs that are already exact duplicates
+            h1 = f1.get('exact_hash')
+            h2 = f2.get('exact_hash')
+            if h1 and h2 and h1 == h2:
                 continue
 
             score = _calculate_score_local(f1, f2)
@@ -50,55 +67,61 @@ def _compare_range(files, start, end, similarity_threshold, stop_signal=None):
                 matches.append({
                     'file_a': f1['path'],
                     'file_b': f2['path'],
-                    'score': score
+                    'score': score,
                 })
 
     return matches
 
-def _calculate_score_local(f1, f2):
-    # Calculates the similarity score between two file records.
-    is_visual = f1['extension'] in VISUAL_EXTS
-    has_visual_hashes = f1['visual_hash'] and f2['visual_hash']
 
-    # Fail immediately if visual hashes are missing for visual files
+def _calculate_score_local(f1, f2):
+    """Calculate a weighted similarity score between two file records."""
+    is_visual = f1['extension'] in VISUAL_EXTS
+    is_audio  = f1['extension'] in AUDIO_EXTS
+    has_visual_hashes = f1.get('visual_hash') and f2.get('visual_hash')
+    has_audio_hashes  = f1.get('audio_hash')  and f2.get('audio_hash')
+
+    # Hard-fail if the expected content hash is missing
     if is_visual and not has_visual_hashes:
         return 0
+    if is_audio and not has_audio_hashes:
+        return 0
 
-    score = 0
-    total_weight = 0
+    score = 0.0
+    total_weight = 0.0
 
-    # 1. Visual Hash Comparison
+    # 1. Visual hash (perceptual) -- 50% weight
     if has_visual_hashes:
         try:
             h1 = imagehash.hex_to_hash(f1['visual_hash'])
             h2 = imagehash.hex_to_hash(f2['visual_hash'])
             dist = h1 - h2
-            sim = max(0, (10 - dist) / 10) * 100
+            sim = max(0.0, (10 - dist) / 10) * 100
             score += sim * 0.50
             total_weight += 0.50
-        except: pass
+        except Exception:
+            pass
 
-    # 2. Audio Hash Comparison
-    if f1['audio_hash'] and f2['audio_hash']:
+    # 2. Audio fingerprint -- 50% weight (binary match only)
+    if has_audio_hashes:
         if f1['audio_hash'] == f2['audio_hash']:
             score += 100 * 0.50
         total_weight += 0.50
 
-    # 3. Filename Similarity
-    if f1['filename'] and f2['filename']:
+    # 3. Filename similarity -- 20% weight
+    if f1.get('filename') and f2.get('filename'):
         name_sim = SequenceMatcher(None, f1['filename'], f2['filename']).ratio() * 100
         score += name_sim * 0.20
         total_weight += 0.20
 
-    # 4. Size Similarity
-    size_a, size_b = f1['size'], f2['size']
+    # 4. File-size similarity -- 10% weight
+    size_a, size_b = f1.get('size', 0), f2.get('size', 0)
     if size_a > 0 and size_b > 0:
-        size_sim = (1 - (abs(size_a - size_b) / max(size_a, size_b))) * 100
+        size_sim = (1 - abs(size_a - size_b) / max(size_a, size_b)) * 100
         score += size_sim * 0.10
         total_weight += 0.10
 
-    # 5. Extension Match
-    if f1['extension'] == f2['extension']:
+    # 5. Extension match -- 5% weight
+    if f1.get('extension') == f2.get('extension'):
         score += 100 * 0.05
         total_weight += 0.05
 
@@ -106,62 +129,71 @@ def _calculate_score_local(f1, f2):
         return 0
     return round(score / total_weight, 1)
 
+
 class Matcher:
     def __init__(self, db_path):
-        # Initialize the database connection
         if not os.path.exists(db_path):
             raise FileNotFoundError(f"Database not found at {db_path}")
-        
         self.conn = sqlite3.connect(db_path)
-        self.conn.row_factory = sqlite3.Row 
+        self.conn.row_factory = sqlite3.Row
 
     def close(self):
-        # Safely close the database connection
-        try: self.conn.close()
-        except: pass
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
     def fetch_all_files(self):
-        # Retrieve all file records that currently exist on disk
+        """Return all indexed file records that still exist on disk."""
         cursor = self.conn.execute("SELECT * FROM files")
-        valid_files = []
+        valid = []
         for row in cursor.fetchall():
             d = dict(row)
             if os.path.exists(d['path']):
-                valid_files.append(d)
-        return valid_files
+                valid.append(d)
+        return valid
 
     def find_exact_duplicates(self):
-        # Identify files with identical exact_hash values
+        """Group files that share an identical MD5 hash."""
         all_files = self.fetch_all_files()
         hash_map = {}
         for f in all_files:
-            if f['exact_hash']:
-                if f['exact_hash'] not in hash_map:
-                    hash_map[f['exact_hash']] = []
-                hash_map[f['exact_hash']].append(f)
-        
-        exact_groups = []
-        for k, group in hash_map.items():
-            if len(group) > 1:
-                exact_groups.append(group)
-        return exact_groups
+            h = f.get('exact_hash')
+            if h:
+                hash_map.setdefault(h, []).append(f)
+        return [group for group in hash_map.values() if len(group) > 1]
 
     def find_fuzzy_matches(self, stop_signal=None, progress_callback=None):
-        # Execute multi-threaded fuzzy matching across all files
+        """
+        Multi-threaded fuzzy comparison across all indexed files.
+
+        FIXED BUG: The original code passed a list of (future, start, end) tuples
+        directly to as_completed(), which expects an iterable of Future objects only.
+        That raised AttributeError on ._condition and silently killed all fuzzy
+        matching -- the feature never worked. Fixed by maintaining a plain future
+        list for as_completed and a separate dict for progress tracking.
+        """
         files = self.fetch_all_files()
-        potential_matches = []
         n = len(files)
-        
+
         if n < 2:
             self.close()
             return []
+
+        # Collect hashes that appear more than once so fuzzy can skip exact pairs
+        hash_counts = {}
+        for f in files:
+            h = f.get('exact_hash')
+            if h:
+                hash_counts[h] = hash_counts.get(h, 0) + 1
+        exact_hashes = {h for h, count in hash_counts.items() if count > 1}
 
         total_comparisons = (n * (n - 1)) // 2
         current_comparison = 0
 
         worker_count = min(MAX_MATCH_WORKERS, max(1, n - 1))
-        # Smaller chunks result in more frequent progress updates and better stop responsiveness
         chunk_size = max(1, n // (worker_count * 16))
+
         ranges = []
         start = 0
         while start < n - 1:
@@ -169,28 +201,34 @@ class Matcher:
             ranges.append((start, end))
             start = end
 
-        # Reverse ranges to process smaller chunks first for smoother progress
+        # Process smaller (later-index) chunks first for smoother early progress
         ranges = ranges[::-1]
 
+        potential_matches = []
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
-        futures_submitted = []
+
+        # Plain list of futures for as_completed; separate dict for range lookup
+        future_list = []
+        future_to_range = {}
+
         try:
-            for start, end in ranges:
+            for s, e in ranges:
                 if stop_signal and stop_signal():
                     break
-                
-                # Pass the stop_signal into the worker function
-                future = executor.submit(_compare_range, files, start, end, SIMILARITY_THRESHOLD, stop_signal)
-                futures_submitted.append((future, start, end))
+                future = executor.submit(
+                    _compare_range, files, s, e,
+                    SIMILARITY_THRESHOLD, exact_hashes, stop_signal
+                )
+                future_list.append(future)
+                future_to_range[future] = (s, e)
 
-            for future in concurrent.futures.as_completed(futures_submitted):
+            for future in concurrent.futures.as_completed(future_list):
                 if stop_signal and stop_signal():
-                    # Cancel remaining futures if aborted
-                    for f, _, _ in futures_submitted:
+                    for f in future_list:
                         if not f.done():
                             f.cancel()
                     break
-                
+
                 try:
                     matches = future.result(timeout=10)
                     potential_matches.extend(matches)
@@ -199,13 +237,10 @@ class Matcher:
                 except Exception:
                     pass
 
-                # Find the start, end for this future to update progress
-                for f, s, e in futures_submitted:
-                    if f == future:
-                        current_comparison += _pair_range_count(s, e, n)
-                        if progress_callback:
-                            progress_callback(current_comparison, total_comparisons)
-                        break
+                s, e = future_to_range.get(future, (0, 0))
+                current_comparison += _pair_range_count(s, e, n)
+                if progress_callback:
+                    progress_callback(current_comparison, total_comparisons)
 
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
