@@ -2,7 +2,7 @@
 
 A cross-platform desktop tool for finding both exact and visually/acoustically similar duplicate files across one or more folders. Built with Python and PyQt6.
 
-![Main interface showing two duplicate images side by side with a similarity percentage, file details, and delete/keep buttons](screens/main.png)
+![Main interface showing two duplicate images side by side with a similarity percentage, file details, and delete/keep buttons](screens/main-pretty.png)
 
 ---
 
